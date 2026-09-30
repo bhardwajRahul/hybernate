@@ -1103,3 +1103,18 @@ func TestReconcile_DestroyRetriesAfterFailureAndKeepsSnapshot(t *testing.T) {
 	require.NotNil(t, destroyed.Status.Destroy.Resources)
 	assert.Equal(t, snapshot, *destroyed.Status.Destroy.Resources)
 }
+
+func TestSetCondition_UpdatesReasonWithoutStatusChange(t *testing.T) {
+	r := &Reconciler{clock: func() time.Time { return fixedTime }}
+	workload := &v1alpha1.ManagedWorkload{}
+
+	r.setCondition(workload, conditionMetricsAvailable, metav1.ConditionFalse, "NoPodMetrics", "no pods reporting")
+	r.clock = func() time.Time { return fixedTime.Add(time.Hour) }
+	r.setCondition(workload, conditionMetricsAvailable, metav1.ConditionFalse, "MetricsUnavailable", "metrics API down")
+
+	cond := meta.FindStatusCondition(workload.Status.Conditions, conditionMetricsAvailable)
+	require.NotNil(t, cond)
+	assert.Equal(t, "MetricsUnavailable", cond.Reason, "a new cause must replace the stale one")
+	assert.Equal(t, "metrics API down", cond.Message)
+	assert.True(t, cond.LastTransitionTime.Time.Equal(fixedTime), "transition time only moves when the status changes")
+}

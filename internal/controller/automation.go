@@ -18,11 +18,14 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha1 "github.com/okedeji/hybernate/api/v1alpha1"
@@ -146,12 +149,11 @@ func (r *Reconciler) reconcileAutomation(ctx context.Context, workload *v1alpha1
 
 	// Feed engine hourly — prediction learns regardless of desiredState.
 	if r.metrics != nil && r.engines.shouldFeed(key, r.now()) {
-		metric, err := r.metrics.TotalCPUMillis(ctx, workload)
+		metric, err := r.observedCPU(ctx, workload)
 		if err != nil {
-			logger.Error(err, "reading metrics, will retry")
-			result := ctrl.Result{RequeueAfter: 1 * time.Minute}
-			return &result, nil
+			return r.reportMetricsUnavailable(ctx, workload, err)
 		}
+		r.setCondition(workload, conditionMetricsAvailable, metav1.ConditionTrue, "MetricsReported", "")
 		prediction := engine.Observe(metric, r.now())
 		r.engines.markFed(key, r.now())
 		r.emitEvent(workload, false, "Normal", ReasonPredictionFed, actionForecast,
@@ -200,6 +202,45 @@ func (r *Reconciler) reconcileAutomation(ctx context.Context, workload *v1alpha1
 	default: // DailyActive, WeeklySuggesting, FullyActive
 		return r.reconcileAutomationPolicies(ctx, workload, engine, workload.Spec.DryRun)
 	}
+}
+
+// observedCPU reads total CPU usage to feed the forecast. A target scaled to
+// zero has no pods and therefore no pod metrics, but that is a real
+// observation of zero demand, not missing data.
+func (r *Reconciler) observedCPU(ctx context.Context, workload *v1alpha1.ManagedWorkload) (float64, error) {
+	millis, err := r.metrics.TotalCPUMillis(ctx, workload)
+	if !errors.Is(err, opmetrics.ErrNoPodMetrics) {
+		return millis, err
+	}
+	if replicas, rerr := r.metrics.Replicas(ctx, workload); rerr == nil && replicas == 0 {
+		return 0, nil
+	}
+	return 0, err
+}
+
+// reportMetricsUnavailable surfaces why the forecast can't be fed. Without
+// it the workload shows Observing indefinitely, with nothing to say it has
+// stopped learning.
+func (r *Reconciler) reportMetricsUnavailable(ctx context.Context, workload *v1alpha1.ManagedWorkload, err error) (*ctrl.Result, error) {
+	reason := "MetricsUnavailable"
+	msg := fmt.Sprintf("cannot read CPU usage, forecast is not learning: %v", err)
+	if errors.Is(err, opmetrics.ErrNoPodMetrics) {
+		reason = "NoPodMetrics"
+		msg = "target has replicas but no pod metrics, forecast is not learning; check that metrics-server is installed and reporting"
+	}
+
+	firstFailure := !meta.IsStatusConditionFalse(workload.Status.Conditions, conditionMetricsAvailable)
+	r.setCondition(workload, conditionMetricsAvailable, metav1.ConditionFalse, reason, msg)
+	if uerr := r.Status().Update(ctx, workload); uerr != nil {
+		return nil, fmt.Errorf("updating metrics condition: %w", uerr)
+	}
+	if firstFailure {
+		r.emitEvent(workload, false, "Warning", reason, actionForecast, "%s", msg)
+	}
+	log.FromContext(ctx).V(1).Info("forecast not fed",
+		"workload", workload.Name, "namespace", workload.Namespace, "reason", reason, "error", err.Error())
+
+	return &ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 }
 
 func (r *Reconciler) reconcileAutoResume(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {

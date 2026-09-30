@@ -510,7 +510,10 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, workload *v1alpha1.Man
 
 // --- Target ---
 
-const conditionTargetAvailable = "TargetAvailable"
+const (
+	conditionTargetAvailable  = "TargetAvailable"
+	conditionMetricsAvailable = "MetricsAvailable"
+)
 
 // checkTarget verifies the target workload exists. Returns the target object
 // on success, nil when not found (condition set, status updated), or an error.
@@ -650,24 +653,12 @@ func (r *Reconciler) acceptDrift(workload *v1alpha1.ManagedWorkload, actual int3
 }
 
 func (r *Reconciler) setCondition(workload *v1alpha1.ManagedWorkload, condType string, status metav1.ConditionStatus, reason, message string) {
-	now := r.clockTime()
-	for i, c := range workload.Status.Conditions {
-		if c.Type == condType {
-			if c.Status != status {
-				workload.Status.Conditions[i].Status = status
-				workload.Status.Conditions[i].Reason = reason
-				workload.Status.Conditions[i].Message = message
-				workload.Status.Conditions[i].LastTransitionTime = now
-			}
-			return
-		}
-	}
-	workload.Status.Conditions = append(workload.Status.Conditions, metav1.Condition{
+	meta.SetStatusCondition(&workload.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
-		LastTransitionTime: now,
+		LastTransitionTime: r.clockTime(),
 	})
 }
 

@@ -37,6 +37,20 @@ kubectl get managedworkload my-api -n staging -o jsonpath='{.status.prediction}'
 
 If `dailyPhase` is `Observing`, the engine hasn't collected enough data yet (needs 24+ hours).
 
+If it has been `Observing` for well over 24 hours, check whether the engine is being fed at all:
+
+```bash
+kubectl get managedworkload my-api -n staging \
+  -o jsonpath='{.status.conditions[?(@.type=="MetricsAvailable")]}'
+```
+
+`MetricsAvailable=False` means the operator can't read the workload's CPU usage, so the forecast isn't learning:
+
+- **`NoPodMetrics`**: the target has replicas, but the Metrics API reports no pods for it. Check that metrics-server is installed (`kubectl top pods -n staging`) and that the target's pods are running.
+- **`MetricsUnavailable`**: the Metrics API itself failed. The condition message has the error; a missing `metrics.k8s.io` API means metrics-server isn't installed.
+
+A target scaled to zero replicas is not an error: it's recorded as zero demand.
+
 ### Workload keeps cycling between paused and running
 
 This usually means idle detection triggers pause, then auto-resume immediately detects "not idle" (because paused workloads have zero CPU, which is below threshold, but the workload has no pods to measure).

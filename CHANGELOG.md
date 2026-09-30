@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Savings for paused and destroyed workloads price memory on the per-replica request, like CPU. The snapshot took CPU from requests but memory from live usage, which skewed savings and disagreed with discovery estimates
 - Taking a resource snapshot no longer panics with an integer divide-by-zero when the target has zero replicas
 - Taking a resource snapshot no longer emits a `TargetNotFound` warning or rewrites the target condition as a side effect
+- Workloads no longer sit in `Observing` indefinitely with no explanation when CPU metrics can't be read (#10). A new `MetricsAvailable` condition reports `NoPodMetrics` or `MetricsUnavailable` with the cause, and a warning event fires when it first fails
+- A target scaled to zero replicas feeds the forecast an observation of zero demand instead of being treated as missing data
+- Status conditions now update their reason and message when the cause changes, even if the status stays the same
 
 ## [0.1.7] - 2026-04-08
 
