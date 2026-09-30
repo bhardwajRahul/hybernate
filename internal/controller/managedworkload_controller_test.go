@@ -24,11 +24,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -918,4 +920,119 @@ func TestReconcile_DuplicateTargetClearsWhenResolved(t *testing.T) {
 			assert.Equal(t, metav1.ConditionFalse, c.Status, "condition should be cleared")
 		}
 	}
+}
+
+func sharedTargetWorkload(name string, uid types.UID, created time.Time) *v1alpha1.ManagedWorkload {
+	return &v1alpha1.ManagedWorkload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			UID:               uid,
+			CreationTimestamp: metav1.NewTime(created),
+			Finalizers:        []string{finalizerName},
+		},
+		Spec: v1alpha1.ManagedWorkloadSpec{
+			Target:     v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: "idle-app"},
+			Prediction: v1alpha1.PredictionSpec{Confidence: 85},
+		},
+	}
+}
+
+func newSharedTargetReconciler(t *testing.T, objs ...client.Object) (*Reconciler, *events.FakeRecorder) {
+	t.Helper()
+	scheme := testScheme(t)
+	recorder := events.NewFakeRecorder(10)
+	k := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.ManagedWorkload{}).
+		WithObjects(append(objs, targetDeployment("idle-app", "default"))...).
+		Build()
+	return &Reconciler{
+		Client:    k,
+		Scheme:    scheme,
+		Recorder:  recorder,
+		pauser:    &stubPauser{},
+		destroyer: &stubDestroyer{},
+		engines:   newEngineRegistry(func(_ int) forecaster { return &stubForecaster{} }),
+		clock:     func() time.Time { return fixedTime },
+	}, recorder
+}
+
+func isDuplicate(t *testing.T, r *Reconciler, name string) bool {
+	t.Helper()
+	return meta.IsStatusConditionTrue(getWorkload(t, r, name).Status.Conditions, conditionDuplicateTarget)
+}
+
+func TestReconcile_DuplicateTargetExactlyOneOwner(t *testing.T) {
+	tests := []struct {
+		name      string
+		olderUID  types.UID
+		newerUID  types.UID
+		sameTime  bool
+		wantOwner string
+	}{
+		{name: "older has smaller UID", olderUID: "aaa", newerUID: "zzz", wantOwner: "older"},
+		{name: "older has larger UID", olderUID: "zzz", newerUID: "aaa", wantOwner: "older"},
+		{name: "same second, smaller UID wins", olderUID: "zzz", newerUID: "aaa", sameTime: true, wantOwner: "newer"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newerCreated := fixedTime
+			if tt.sameTime {
+				newerCreated = fixedTime.Add(-1 * time.Hour)
+			}
+			older := sharedTargetWorkload("older", tt.olderUID, fixedTime.Add(-1*time.Hour))
+			newer := sharedTargetWorkload("newer", tt.newerUID, newerCreated)
+			r, _ := newSharedTargetReconciler(t, older, newer)
+
+			for _, name := range []string{"older", "newer"} {
+				_, err := r.Reconcile(context.Background(), reconcileFor(name))
+				require.NoError(t, err)
+			}
+
+			assert.NotEqual(t, isDuplicate(t, r, "older"), isDuplicate(t, r, "newer"),
+				"exactly one workload must own the target")
+			assert.False(t, isDuplicate(t, r, tt.wantOwner), "%s should own the target", tt.wantOwner)
+		})
+	}
+}
+
+func TestReconcile_DuplicateTakesOverWhenOwnerIsDeleting(t *testing.T) {
+	owner := sharedTargetWorkload("older", "aaa", fixedTime.Add(-1*time.Hour))
+	deleting := metav1.NewTime(fixedTime)
+	owner.DeletionTimestamp = &deleting
+	duplicate := sharedTargetWorkload("newer", "bbb", fixedTime)
+	r, _ := newSharedTargetReconciler(t, owner, duplicate)
+
+	_, err := r.Reconcile(context.Background(), reconcileFor("newer"))
+	require.NoError(t, err)
+
+	assert.False(t, isDuplicate(t, r, "newer"))
+}
+
+func TestReconcile_DuplicateRequeuesAndWarnsOnce(t *testing.T) {
+	owner := sharedTargetWorkload("older", "aaa", fixedTime.Add(-1*time.Hour))
+	duplicate := sharedTargetWorkload("newer", "bbb", fixedTime)
+	r, recorder := newSharedTargetReconciler(t, owner, duplicate)
+
+	for range 2 {
+		result, err := r.Reconcile(context.Background(), reconcileFor("newer"))
+		require.NoError(t, err)
+		assert.Equal(t, duplicateRecheckInterval, result.RequeueAfter)
+	}
+
+	assert.Len(t, recorder.Events, 1, "duplicate warning should only fire when first detected")
+}
+
+func TestFindWorkloadsSharingTarget(t *testing.T) {
+	owner := sharedTargetWorkload("older", "aaa", fixedTime.Add(-1*time.Hour))
+	duplicate := sharedTargetWorkload("newer", "bbb", fixedTime)
+	unrelated := sharedTargetWorkload("other", "ccc", fixedTime)
+	unrelated.Spec.Target.Name = "other-app"
+	r, _ := newSharedTargetReconciler(t, owner, duplicate, unrelated)
+
+	requests := r.findWorkloadsSharingTarget(context.Background(), owner)
+
+	assert.Equal(t, []reconcile.Request{reconcileFor("newer")}, requests)
 }

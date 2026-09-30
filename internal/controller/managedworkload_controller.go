@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,6 +45,11 @@ import (
 const (
 	finalizerName            = v1alpha1.FinalizerCleanup
 	conditionDuplicateTarget = "DuplicateTarget"
+
+	// duplicateRecheckInterval is a safety net for a blocked duplicate. Owner
+	// deletion re-triggers it immediately via the sibling watch, but an owner
+	// that is retargeted only emits an event carrying its new target.
+	duplicateRecheckInterval = 5 * time.Minute
 )
 
 // Reconciler drives ManagedWorkload objects through their lifecycle.
@@ -111,7 +117,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	if duplicate, err := r.checkDuplicate(ctx, &workload); err != nil {
 		return ctrl.Result{}, fmt.Errorf("checking duplicate target: %w", err)
 	} else if duplicate {
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: duplicateRecheckInterval}, nil
 	}
 
 	// Set initial phase.
@@ -649,21 +655,25 @@ func (r *Reconciler) checkDuplicate(ctx context.Context, workload *v1alpha1.Mana
 		return false, fmt.Errorf("listing managed workloads: %w", err)
 	}
 
-	for _, other := range list.Items {
-		if other.UID == workload.UID {
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.UID == workload.UID || !other.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if other.Spec.Target.Kind == workload.Spec.Target.Kind && other.Spec.Target.Name == workload.Spec.Target.Name {
-			if other.CreationTimestamp.Before(&workload.CreationTimestamp) || other.UID < workload.UID {
-				msg := fmt.Sprintf("%s/%s is already managed by %s", workload.Spec.Target.Kind, workload.Spec.Target.Name, other.Name)
-				r.setCondition(workload, conditionDuplicateTarget, metav1.ConditionTrue, conditionDuplicateTarget, msg)
-				r.Recorder.Eventf(workload, nil, "Warning", conditionDuplicateTarget, actionCheckDuplicate, "%s", msg)
-				if err := r.Status().Update(ctx, workload); err != nil {
-					return false, fmt.Errorf("updating duplicate condition: %w", err)
-				}
-				return true, nil
-			}
+		if other.Spec.Target != workload.Spec.Target || !claimsTargetFirst(other, workload) {
+			continue
 		}
+
+		msg := fmt.Sprintf("%s/%s is already managed by %s", workload.Spec.Target.Kind, workload.Spec.Target.Name, other.Name)
+		alreadyFlagged := meta.IsStatusConditionTrue(workload.Status.Conditions, conditionDuplicateTarget)
+		r.setCondition(workload, conditionDuplicateTarget, metav1.ConditionTrue, conditionDuplicateTarget, msg)
+		if err := r.Status().Update(ctx, workload); err != nil {
+			return false, fmt.Errorf("updating duplicate condition: %w", err)
+		}
+		if !alreadyFlagged {
+			r.Recorder.Eventf(workload, nil, "Warning", conditionDuplicateTarget, actionCheckDuplicate, "%s", msg)
+		}
+		return true, nil
 	}
 
 	// Clear the condition if it was previously set and the conflict is gone.
@@ -681,6 +691,43 @@ func (r *Reconciler) checkDuplicate(ctx context.Context, workload *v1alpha1.Mana
 	}
 
 	return false, nil
+}
+
+// claimsTargetFirst reports whether a owns a shared target ahead of b. The
+// oldest ManagedWorkload wins. Creation timestamps have one-second precision,
+// so UID breaks ties between objects created in the same second.
+func claimsTargetFirst(a, b *v1alpha1.ManagedWorkload) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.UID < b.UID
+}
+
+// findWorkloadsSharingTarget enqueues the other ManagedWorkloads that target
+// the same workload, so a blocked duplicate takes over as soon as the owner
+// is deleted.
+func (r *Reconciler) findWorkloadsSharingTarget(ctx context.Context, obj client.Object) []reconcile.Request {
+	changed, ok := obj.(*v1alpha1.ManagedWorkload)
+	if !ok {
+		return nil
+	}
+
+	var list v1alpha1.ManagedWorkloadList
+	if err := r.List(ctx, &list, client.InNamespace(changed.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "listing managed workloads sharing a target",
+			"workload", changed.Name, "namespace", changed.Namespace)
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, w := range list.Items {
+		if w.UID != changed.UID && w.Spec.Target == changed.Spec.Target {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: w.Name, Namespace: w.Namespace},
+			})
+		}
+	}
+	return requests
 }
 
 func (r *Reconciler) findWorkloadsForTarget(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -770,6 +817,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	targetHandler := handler.EnqueueRequestsFromMapFunc(r.findWorkloadsForTarget)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.ManagedWorkload{}).
+		Watches(&v1alpha1.ManagedWorkload{}, handler.EnqueueRequestsFromMapFunc(r.findWorkloadsSharingTarget)).
 		Watches(&appsv1.Deployment{}, targetHandler).
 		Watches(&appsv1.StatefulSet{}, targetHandler).
 		Named("managedworkload").
