@@ -143,9 +143,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		}
 	}
 
+	// --- In-flight transitions ---
+
+	result, err := r.resumeTransition(ctx, &workload)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if result != nil {
+		return *result, nil
+	}
+
 	// --- Manual lifecycle ---
 
-	result, err := r.reconcileDesiredState(ctx, &workload)
+	result, err = r.reconcileDesiredState(ctx, &workload)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -181,6 +191,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 
 	logger.Info("reconciled", "phase", workload.Status.Phase)
 	return ctrl.Result{}, nil
+}
+
+// resumeTransition finishes a pause, resume, or destroy that an earlier
+// reconcile started but didn't complete. Without it, a transient failure
+// strands the workload in the intermediate phase, because neither the manual
+// nor the automated paths act on Pausing, Resuming, or Destroying.
+func (r *Reconciler) resumeTransition(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {
+	switch workload.Status.Phase {
+	case v1alpha1.PhasePausing:
+		return r.handlePause(ctx, workload)
+	case v1alpha1.PhaseResuming:
+		return r.handleResume(ctx, workload)
+	case v1alpha1.PhaseDestroying:
+		return r.handleDestroy(ctx, workload)
+	default:
+		return nil, nil
+	}
 }
 
 func (r *Reconciler) reconcileDesiredState(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {
@@ -278,19 +305,21 @@ func (r *Reconciler) handleResume(ctx context.Context, workload *v1alpha1.Manage
 }
 
 func (r *Reconciler) handleDestroy(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {
-	phase := workload.Status.Phase
-	if phase == v1alpha1.PhaseDestroyed {
+	switch workload.Status.Phase {
+	case v1alpha1.PhaseDestroyed:
 		return nil, nil
-	}
-	if phase == v1alpha1.PhaseDestroying {
-		return nil, nil
-	}
-
-	// Capture resource profile before deletion for cost savings tracking.
-	snap := r.captureResourceSnapshot(ctx, workload)
-
-	if _, err := r.transition(ctx, workload, v1alpha1.PhaseDestroying, "DestroyRequested"); err != nil {
-		return nil, err
+	case v1alpha1.PhaseDestroying:
+		// Retrying: the snapshot was persisted with the Destroying phase, and
+		// the target may already be gone, so don't capture it again.
+	default:
+		// Persist the snapshot with the phase so it survives a failed delete.
+		if workload.Status.Destroy == nil {
+			workload.Status.Destroy = &v1alpha1.DestroyStatus{}
+		}
+		workload.Status.Destroy.Resources = r.captureResourceSnapshot(ctx, workload)
+		if _, err := r.transition(ctx, workload, v1alpha1.PhaseDestroying, "DestroyRequested"); err != nil {
+			return nil, err
+		}
 	}
 
 	done, err := r.destroyer.Destroy(ctx, workload)
@@ -304,10 +333,6 @@ func (r *Reconciler) handleDestroy(ctx context.Context, workload *v1alpha1.Manag
 
 	r.stampLastActed(workload)
 	r.observeActionDuration(workload, "destroy")
-	if workload.Status.Destroy == nil {
-		workload.Status.Destroy = &v1alpha1.DestroyStatus{}
-	}
-	workload.Status.Destroy.Resources = snap
 	result, err := r.transition(ctx, workload, v1alpha1.PhaseDestroyed, "Destroyed")
 	if err != nil {
 		return nil, err

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -1035,4 +1036,70 @@ func TestFindWorkloadsSharingTarget(t *testing.T) {
 	requests := r.findWorkloadsSharingTarget(context.Background(), owner)
 
 	assert.Equal(t, []reconcile.Request{reconcileFor("newer")}, requests)
+}
+
+func lifecycleWorkload(name string, desired *v1alpha1.DesiredState, phase v1alpha1.WorkloadPhase) *v1alpha1.ManagedWorkload {
+	return &v1alpha1.ManagedWorkload{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: v1alpha1.ManagedWorkloadSpec{
+			Target:       v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: name},
+			DesiredState: desired,
+		},
+		Status: v1alpha1.ManagedWorkloadStatus{Phase: phase},
+	}
+}
+
+func TestReconcile_ResumesInterruptedTransition(t *testing.T) {
+	tests := []struct {
+		name      string
+		phase     v1alpha1.WorkloadPhase
+		wantPhase v1alpha1.WorkloadPhase
+	}{
+		{name: "pause", phase: v1alpha1.PhasePausing, wantPhase: v1alpha1.PhasePaused},
+		{name: "resume", phase: v1alpha1.PhaseResuming, wantPhase: v1alpha1.PhaseRunning},
+		{name: "destroy", phase: v1alpha1.PhaseDestroying, wantPhase: v1alpha1.PhaseDestroyed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// No desiredState: this is the automated path, where nothing
+			// else would pick the transition back up.
+			workload := lifecycleWorkload("stuck-app", nil, tt.phase)
+			pauser := &stubPauser{pauseDone: true, resumeDone: true}
+			destroyer := &stubDestroyer{destroyDone: true}
+			r := newTestReconciler(t, workload, pauser, destroyer)
+
+			_, err := r.Reconcile(context.Background(), reconcileFor("stuck-app"))
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantPhase, getWorkload(t, r, "stuck-app").Status.Phase)
+		})
+	}
+}
+
+func TestReconcile_DestroyRetriesAfterFailureAndKeepsSnapshot(t *testing.T) {
+	workload := lifecycleWorkload("doomed-app", desiredState(v1alpha1.DesiredStateDestroyed), v1alpha1.PhaseRunning)
+	destroyer := &stubDestroyer{destroyErr: errors.New("api server unavailable")}
+	r := newTestReconciler(t, workload, &stubPauser{}, destroyer)
+	r.metrics = &stubMetrics{cpuPerReplica: 500, memoryBytes: 256 << 20}
+
+	_, err := r.Reconcile(context.Background(), reconcileFor("doomed-app"))
+	require.Error(t, err)
+
+	failed := getWorkload(t, r, "doomed-app")
+	require.Equal(t, v1alpha1.PhaseDestroying, failed.Status.Phase)
+	require.NotNil(t, failed.Status.Destroy)
+	require.NotNil(t, failed.Status.Destroy.Resources, "snapshot must be persisted before the delete is attempted")
+	snapshot := *failed.Status.Destroy.Resources
+
+	destroyer.destroyErr = nil
+	destroyer.destroyDone = true
+	_, err = r.Reconcile(context.Background(), reconcileFor("doomed-app"))
+	require.NoError(t, err)
+
+	destroyed := getWorkload(t, r, "doomed-app")
+	assert.Equal(t, v1alpha1.PhaseDestroyed, destroyed.Status.Phase)
+	assert.Equal(t, 2, destroyer.destroyCalls)
+	require.NotNil(t, destroyed.Status.Destroy.Resources)
+	assert.Equal(t, snapshot, *destroyed.Status.Destroy.Resources)
 }
