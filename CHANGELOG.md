@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Events are emitted through the `events.k8s.io/v1` API (`events.EventRecorder`) instead of the deprecated `record.EventRecorder`. Each event now carries an action (e.g. `Pause`, `EvaluateIdle`, `CheckDrift`). The operator's ClusterRole gains `create`/`patch` on `events.k8s.io` events; the Helm chart and kustomize RBAC include it
+
 ### Fixed
 
 - Prometheus signals now work. The operator never received a Prometheus URL, and signal checkers were built without an HTTP client, so any workload with `idlePolicy.signals` or `scalePolicy.down.guard` panicked on evaluation. Configure the endpoint with the new `--prometheus-url` flag (Helm value `prometheus.url`); the documented `PROMETHEUS_ENDPOINT` environment variable was never read and is removed from the docs

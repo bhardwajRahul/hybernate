@@ -136,11 +136,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	recorder := mgr.GetEventRecorderFor("hybernate") //nolint:staticcheck // migrate to events.EventRecorder in a future PR
 	if err := (&controller.Reconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
-		Recorder:      recorder,
+		Recorder:      mgr.GetEventRecorder("hybernate"),
 		PrometheusURL: prometheusURL,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ManagedWorkload")
@@ -156,7 +155,7 @@ func main() {
 	if err := (&controller.WorkloadPolicyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("workloadpolicy"), //nolint:staticcheck
+		Recorder: mgr.GetEventRecorder("workloadpolicy"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "WorkloadPolicy")
 		os.Exit(1)

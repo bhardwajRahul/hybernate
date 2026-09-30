@@ -56,12 +56,33 @@ const (
 	ReasonDriftDetected        = "DriftDetected"
 	ReasonDriftCorrected       = "DriftCorrected"
 	ReasonRegimeChange         = "RegimeChange"
+	ReasonTargetNotFound       = "TargetNotFound"
 )
 
-func (r *Reconciler) emitEvent(workload *v1alpha1.ManagedWorkload, dryRun bool, eventType, reason, msgFmt string, args ...any) {
+// Actions populate the events.k8s.io/v1 Action field, which the API server
+// requires: what the operator did or tried to do when the event fired.
+const (
+	actionForecast       = "Forecast"
+	actionEvaluate       = "EvaluateAutomation"
+	actionEvaluateIdle   = "EvaluateIdle"
+	actionScale          = "Scale"
+	actionPause          = "Pause"
+	actionResume         = "Resume"
+	actionDestroy        = "Destroy"
+	actionExpirePause    = "ExpirePause"
+	actionCleanupPVCs    = "CleanupPVCs"
+	actionCheckTarget    = "CheckTarget"
+	actionCheckDrift     = "CheckDrift"
+	actionCorrectDrift   = "CorrectDrift"
+	actionCheckDuplicate = "CheckDuplicate"
+	actionAutoManage     = "AutoManage"
+	actionScan           = "Scan"
+)
+
+func (r *Reconciler) emitEvent(workload *v1alpha1.ManagedWorkload, dryRun bool, eventType, reason, action, msgFmt string, args ...any) {
 	msg := fmt.Sprintf(msgFmt, args...)
-	r.Recorder.Event(workload, eventType, reason,
-		fmt.Sprintf("%s%s: %s", dryRunPrefix(dryRun), workload.Spec.Target.Name, msg))
+	r.Recorder.Eventf(workload, nil, eventType, reason, action,
+		"%s%s: %s", dryRunPrefix(dryRun), workload.Spec.Target.Name, msg)
 }
 
 func dryRunPrefix(dryRun bool) string {

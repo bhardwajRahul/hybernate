@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -43,7 +43,7 @@ const defaultScanInterval = 10 * time.Minute
 type WorkloadPolicyReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=hybernate.io,resources=workloadpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -96,8 +96,8 @@ func (r *WorkloadPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		created := r.autoManage(ctx, &policy, result)
 		if created > 0 {
 			log.Info("auto-managed workloads", "namespace", policy.Namespace, "count", created)
-			r.Recorder.Event(&policy, "Normal", "AutoManaged",
-				fmt.Sprintf("Created %d ManagedWorkload CRs (dryRun: %t)", created, policy.Spec.DryRun))
+			r.Recorder.Eventf(&policy, nil, "Normal", "AutoManaged", actionAutoManage,
+				"Created %d ManagedWorkload CRs (dryRun: %t)", created, policy.Spec.DryRun)
 		}
 	}
 
@@ -123,10 +123,10 @@ func (r *WorkloadPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 
-	r.Recorder.Event(&policy, "Normal", "ScanCompleted",
-		fmt.Sprintf("Discovered %d workloads: %d active, %d idle, %d wasteful (cost: %s, savings: %s)",
-			result.Summary.Total, result.Summary.Active, result.Summary.Idle, result.Summary.Wasteful,
-			result.Summary.EstimatedMonthlyCost, result.Summary.EstimatedPotentialSavings))
+	r.Recorder.Eventf(&policy, nil, "Normal", "ScanCompleted", actionScan,
+		"Discovered %d workloads: %d active, %d idle, %d wasteful (cost: %s, savings: %s)",
+		result.Summary.Total, result.Summary.Active, result.Summary.Idle, result.Summary.Wasteful,
+		result.Summary.EstimatedMonthlyCost, result.Summary.EstimatedPotentialSavings)
 
 	return ctrl.Result{RequeueAfter: requeueInterval(policy.Spec)}, nil
 }

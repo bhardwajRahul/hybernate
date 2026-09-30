@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/okedeji/hybernate/api/v1alpha1"
@@ -181,7 +181,7 @@ func newAutomationReconciler(t *testing.T, workload *v1alpha1.ManagedWorkload, e
 	r := &Reconciler{
 		Client:          builder.Build(),
 		Scheme:          scheme,
-		Recorder:        record.NewFakeRecorder(10),
+		Recorder:        events.NewFakeRecorder(10),
 		pauser:          opts.pauser,
 		destroyer:       opts.destroyer,
 		lifecycleScaler: opts.lifecycleScaler,

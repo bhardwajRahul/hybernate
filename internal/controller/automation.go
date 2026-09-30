@@ -154,12 +154,12 @@ func (r *Reconciler) reconcileAutomation(ctx context.Context, workload *v1alpha1
 		}
 		prediction := engine.Observe(metric, r.now())
 		r.engines.markFed(key, r.now())
-		r.emitEvent(workload, false, "Normal", ReasonPredictionFed,
+		r.emitEvent(workload, false, "Normal", ReasonPredictionFed, actionForecast,
 			"fed %.0fm CPU, forecast %.0fm, phase %s", metric, prediction, engine.GetPhase())
 
 		if engine.RegimeChanged() {
 			opmetrics.PredictionRegimeChanges.WithLabelValues(workload.Namespace, workload.Name).Inc()
-			r.emitEvent(workload, false, "Warning", ReasonRegimeChange,
+			r.emitEvent(workload, false, "Warning", ReasonRegimeChange, actionForecast,
 				"regime change detected, prediction engine demoted to %s", engine.GetPhase())
 		}
 		if engine.AnomalyDetected() {
@@ -174,7 +174,7 @@ func (r *Reconciler) reconcileAutomation(ctx context.Context, workload *v1alpha1
 	// automation does not act. Status is updated above.
 	if workload.Spec.DesiredState != nil {
 		opmetrics.AutomationSkipped.WithLabelValues(workload.Namespace, workload.Name).Inc()
-		r.emitEvent(workload, false, "Normal", ReasonAutomationSkipped,
+		r.emitEvent(workload, false, "Normal", ReasonAutomationSkipped, actionEvaluate,
 			"automation skipped, desiredState is manually set to %s", *workload.Spec.DesiredState)
 		if err := r.Status().Update(ctx, workload); err != nil {
 			return nil, fmt.Errorf("updating prediction status: %w", err)
@@ -240,7 +240,7 @@ func (r *Reconciler) reconcileAutoResume(ctx context.Context, workload *v1alpha1
 		return nil, nil
 	}
 
-	r.emitEvent(workload, dryRun, "Normal", ReasonAutoResume,
+	r.emitEvent(workload, dryRun, "Normal", ReasonAutoResume, actionResume,
 		"prediction expects %.0f%% utilization (threshold %d%%), resuming", predictedPercent, cpuPercent)
 
 	if dryRun {
@@ -290,7 +290,7 @@ func (r *Reconciler) reconcileIdleAction(ctx context.Context, workload *v1alpha1
 	}
 	eval, err := r.idle.Evaluate(ctx, workload.Namespace, workload.Spec.Target.Name, signals, idleGracePeriod(workload))
 	if err != nil {
-		r.emitEvent(workload, dryRun, "Warning", ReasonIdleConsensus,
+		r.emitEvent(workload, dryRun, "Warning", ReasonIdleConsensus, actionEvaluateIdle,
 			"failed to get idle signal consensus, %v", err)
 		return nil, fmt.Errorf("evaluating idle: %w", err)
 	}
@@ -317,14 +317,14 @@ func (r *Reconciler) reconcileIdleAction(ctx context.Context, workload *v1alpha1
 		}
 		if predictedPercent >= float64(cpuPercent) {
 			opmetrics.IdleFlukes.WithLabelValues(ns, name).Inc()
-			r.emitEvent(workload, dryRun, "Normal", ReasonIdleFluke,
+			r.emitEvent(workload, dryRun, "Normal", ReasonIdleFluke, actionEvaluateIdle,
 				"signals confirm idle but prediction disagrees (predicted %.0f%% utilization, threshold %d%%), rechecking",
 				predictedPercent, cpuPercent)
 			result := ctrl.Result{RequeueAfter: 5 * time.Minute}
 			return &result, nil
 		}
 		r.idle.StartGracePeriod(workload.Namespace, workload.Spec.Target.Name)
-		r.emitEvent(workload, dryRun, "Normal", ReasonIdleGracePeriod,
+		r.emitEvent(workload, dryRun, "Normal", ReasonIdleGracePeriod, actionEvaluateIdle,
 			"signals and prediction confirm idle (predicted demand %.0fm), starting grace period",
 			predicted)
 		result := ctrl.Result{RequeueAfter: 30 * time.Second}
@@ -332,7 +332,7 @@ func (r *Reconciler) reconcileIdleAction(ctx context.Context, workload *v1alpha1
 
 	case eval.InGracePeriod():
 		opmetrics.IdleSignalResult.WithLabelValues(ns, name).Set(3)
-		r.emitEvent(workload, dryRun, "Normal", ReasonIdleGracePeriod,
+		r.emitEvent(workload, dryRun, "Normal", ReasonIdleGracePeriod, actionEvaluateIdle,
 			"in grace period, idle for %s", eval.IdleDuration())
 		result := ctrl.Result{RequeueAfter: 30 * time.Second}
 		return &result, nil
@@ -341,12 +341,12 @@ func (r *Reconciler) reconcileIdleAction(ctx context.Context, workload *v1alpha1
 		opmetrics.IdleSignalResult.WithLabelValues(ns, name).Set(4)
 		action := resolveIdleAction(workload)
 		opmetrics.IdleDetections.WithLabelValues(string(action), ns, name).Inc()
-		r.emitEvent(workload, dryRun, "Normal", ReasonIdleDetected,
+		r.emitEvent(workload, dryRun, "Normal", ReasonIdleDetected, actionEvaluateIdle,
 			"idle for %s, executing %s", eval.IdleDuration(), action)
 
 		if dryRun {
 			opmetrics.DryrunActions.WithLabelValues("idle_" + string(action)).Inc()
-			r.emitEvent(workload, dryRun, "Normal", ReasonIdleDetected,
+			r.emitEvent(workload, dryRun, "Normal", ReasonIdleDetected, actionEvaluateIdle,
 				"would %s workload (idle for %s)", action, eval.IdleDuration())
 			return nil, nil
 		}
@@ -376,7 +376,7 @@ func (r *Reconciler) reconcileScaleAction(ctx context.Context, workload *v1alpha
 
 	cpuPerReplica, err := r.metrics.CPURequestPerReplica(ctx, workload)
 	if err != nil && sp.OverrideReplicas == nil {
-		r.emitEvent(workload, dryRun, "Warning", ReasonScalingUnavailable,
+		r.emitEvent(workload, dryRun, "Warning", ReasonScalingUnavailable, actionScale,
 			"cannot compute replica count, %v", err)
 		return nil, fmt.Errorf("reading cpu request per replica: %w", err)
 	}
@@ -435,7 +435,7 @@ func (r *Reconciler) reconcileScaleAction(ctx context.Context, workload *v1alpha
 		}
 		if !res.Confirm {
 			opmetrics.ScaleGuardBlocked.WithLabelValues(ns, name).Inc()
-			r.emitEvent(workload, dryRun, "Normal", ReasonScaleDownGuarded,
+			r.emitEvent(workload, dryRun, "Normal", ReasonScaleDownGuarded, actionScale,
 				"scale-down to %d blocked: %s", target, res.Reason)
 			result := ctrl.Result{RequeueAfter: 1 * time.Minute}
 			return &result, nil
@@ -445,11 +445,11 @@ func (r *Reconciler) reconcileScaleAction(ctx context.Context, workload *v1alpha
 	if dryRun {
 		opmetrics.DryrunActions.WithLabelValues("scale_" + decision.Direction.String()).Inc()
 		if override {
-			r.emitEvent(workload, dryRun, "Normal", ReasonScaled,
+			r.emitEvent(workload, dryRun, "Normal", ReasonScaled, actionScale,
 				"would scale to %d replicas (manual override, predicted demand %.0fm)",
 				target, predicted)
 		} else {
-			r.emitEvent(workload, dryRun, "Normal", ReasonScaled,
+			r.emitEvent(workload, dryRun, "Normal", ReasonScaled, actionScale,
 				"would scale to %d replicas (predicted demand %.0fm, cpu/replica %.0fm)",
 				target, predicted, cpuPerReplica)
 		}
@@ -473,7 +473,7 @@ func (r *Reconciler) reconcileScaleAction(ctx context.Context, workload *v1alpha
 	r.stampLastActed(workload)
 	opmetrics.ScaleEvents.WithLabelValues(decision.Direction.String(), ns, name).Inc()
 	opmetrics.ScaleReplicas.WithLabelValues(ns, name).Set(float64(target))
-	r.emitEvent(workload, false, "Normal", ReasonScaled,
+	r.emitEvent(workload, false, "Normal", ReasonScaled, actionScale,
 		"scaled to %d replicas", target)
 
 	result, err := r.transition(ctx, workload, v1alpha1.PhaseRunning, "ScaleComplete")
