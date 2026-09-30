@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workloads no longer get stuck in `Pausing`, `Resuming`, or `Destroying` after a transient failure. These intermediate phases were persisted before the action ran, and nothing acted on them afterwards, so one failed API call stranded the workload for good. Interrupted transitions are now retried until they finish
 - Destroy is idempotent: a target that is already gone counts as destroyed, so a delete that succeeded before its status update failed no longer errors on every retry
 - The resource snapshot used for savings is persisted before the delete is attempted, so it survives a failed attempt instead of being re-captured from a target that may no longer exist
+- Discovery ranks workloads by their numeric savings. It compared the formatted dollar strings, so `$9.42` ranked above `$11.68`, and in namespaces over 500 workloads the cap kept the wrong ones
+- The discovery summary counts every scanned workload, matching the cost and savings totals, instead of only the first 500
 
 ## [0.1.7] - 2026-04-08
 
