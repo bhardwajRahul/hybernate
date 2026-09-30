@@ -195,3 +195,43 @@ func TestResume_NoPauseStatusIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, done)
 }
+
+// The controller creates Status.Pause to hold the resource snapshot before
+// calling Pause. The replica count must still be recorded, or resume brings
+// the workload back with a single replica.
+func TestPause_RecordsReplicasWhenSnapshotAlreadyPresent(t *testing.T) {
+	scheme := testScheme(t)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To(int32(3)),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "api"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "app:latest"}}},
+			},
+		},
+	}
+	workload := &v1alpha1.ManagedWorkload{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"},
+		Spec: v1alpha1.ManagedWorkloadSpec{
+			Target: v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: "api"},
+		},
+		Status: v1alpha1.ManagedWorkloadStatus{
+			Pause: &v1alpha1.PauseStatus{
+				Resources: &v1alpha1.ResourceSnapshot{Replicas: 3, CPUMillis: 500},
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dep).Build()
+	scaler := &fakeScaler{replicas: 3}
+	p := newTestPauser(c, scaler)
+
+	done, err := p.Pause(context.Background(), workload)
+	require.NoError(t, err)
+	assert.True(t, done)
+	assert.Equal(t, int32(3), workload.Status.Pause.PreviousReplicas)
+	assert.NotNil(t, workload.Status.Pause.Resources, "the snapshot must survive the pause")
+	assert.Equal(t, int32(0), scaler.replicas)
+}
