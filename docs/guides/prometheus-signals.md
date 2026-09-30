@@ -42,13 +42,17 @@ The query returns `1` when active connections are below 10, confirming it's safe
 
 ## Prometheus Endpoint
 
-The operator needs to know where your Prometheus instance lives. This is configured via the `PROMETHEUS_ENDPOINT` environment variable on the operator deployment:
+The operator needs to know where your Prometheus instance lives. Set it with the `prometheus.url` Helm value, which passes `--prometheus-url` to the operator:
 
-```yaml title="deployment.yaml" linenums="1"
-env:
-  - name: PROMETHEUS_ENDPOINT
-    value: "http://prometheus.monitoring.svc.cluster.local:9090"
+```bash
+helm upgrade --install hybernate oci://ghcr.io/okedeji/charts/hybernate \
+  --namespace hybernate-system \
+  --set prometheus.url=http://prometheus.monitoring.svc.cluster.local:9090
 ```
+
+The URL is the base of the Prometheus HTTP API. Hybernate appends `/api/v1/query`, keeping any path prefix, so endpoints like `https://mimir.example.com/prometheus` work as-is.
+
+If a workload uses Prometheus signals but no URL is configured, idle evaluation fails with a `prometheus endpoint not configured` error in the workload's events instead of silently skipping the signal.
 
 ## Example Signals
 

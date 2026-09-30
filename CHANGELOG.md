@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Prometheus signals now work. The operator never received a Prometheus URL, and signal checkers were built without an HTTP client, so any workload with `idlePolicy.signals` or `scalePolicy.down.guard` panicked on evaluation. Configure the endpoint with the new `--prometheus-url` flag (Helm value `prometheus.url`); the documented `PROMETHEUS_ENDPOINT` environment variable was never read and is removed from the docs
+- Prometheus endpoints served under a path prefix (Thanos, Mimir, reverse proxies) no longer have their prefix replaced by `/api/v1/query`
+- Evaluating a Prometheus signal without a configured endpoint now fails with a clear `prometheus endpoint not configured` error
+
 ## [0.1.7] - 2026-04-08
 
 ### Fixed

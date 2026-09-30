@@ -19,6 +19,7 @@ package signal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -27,6 +28,10 @@ import (
 )
 
 const prometheusTimeout = 5 * time.Second
+
+// ErrEndpointNotConfigured is returned when a Prometheus signal is evaluated
+// but the operator was started without a Prometheus URL.
+var ErrEndpointNotConfigured = errors.New("prometheus endpoint not configured, set --prometheus-url on the operator")
 
 type prometheusResponse struct {
 	Status string `json:"status"`
@@ -59,11 +64,16 @@ func NewPrometheus(endpoint, query string) *Prometheus {
 }
 
 func (p *Prometheus) Check(ctx context.Context, _, _ string) (Result, error) {
+	if p.Endpoint == "" {
+		return Result{}, ErrEndpointNotConfigured
+	}
 	u, err := url.Parse(p.Endpoint)
 	if err != nil {
 		return Result{}, fmt.Errorf("parsing prometheus endpoint: %w", err)
 	}
-	u.Path = "/api/v1/query"
+	// Join rather than replace the path so endpoints served under a prefix
+	// (Thanos, Mimir, or Prometheus behind a reverse proxy) keep working.
+	u = u.JoinPath("api", "v1", "query")
 	u.RawQuery = url.Values{"query": {p.Query}}.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)

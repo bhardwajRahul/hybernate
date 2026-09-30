@@ -241,10 +241,7 @@ func (r *Reconciler) appendUserSignals(checkers []signal.Checker, specs []v1alph
 	for _, s := range specs {
 		switch s.Source {
 		case v1alpha1.ProbeSourcePrometheus:
-			checkers = append(checkers, &signal.Prometheus{
-				Endpoint: r.prometheusURL,
-				Query:    s.PromQL,
-			})
+			checkers = append(checkers, signal.NewPrometheus(r.prometheusURL, s.PromQL))
 		}
 	}
 	return checkers

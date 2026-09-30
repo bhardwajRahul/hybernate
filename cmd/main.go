@@ -19,6 +19,8 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
+	"net/url"
 	"os"
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -58,6 +60,7 @@ func main() {
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
 	var probeAddr string
+	var prometheusURL string
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
@@ -74,12 +77,19 @@ func main() {
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "Metrics server certificate file name.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "Metrics server key file name.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false, "Enable HTTP/2 for metrics and webhook servers.")
+	flag.StringVar(&prometheusURL, "prometheus-url", "",
+		"Base URL of the Prometheus API used for PromQL signals, e.g. http://prometheus.monitoring.svc:9090.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := validatePrometheusURL(prometheusURL); err != nil {
+		setupLog.Error(err, "invalid --prometheus-url")
+		os.Exit(1)
+	}
 
 	if !enableHTTP2 {
 		tlsOpts = append(tlsOpts, func(c *tls.Config) {
@@ -126,10 +136,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	recorder := mgr.GetEventRecorderFor("hybernate") //nolint:staticcheck // migrate to events.EventRecorder in a future PR
 	if err := (&controller.Reconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("hybernate"), //nolint:staticcheck // migrate to events.EventRecorder in a future PR
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      recorder,
+		PrometheusURL: prometheusURL,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ManagedWorkload")
 		os.Exit(1)
@@ -165,4 +177,24 @@ func main() {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)
 	}
+}
+
+// validatePrometheusURL fails fast on a malformed URL so a typo surfaces at
+// startup instead of as a signal error on every reconcile. Empty is valid:
+// Prometheus signals are optional.
+func validatePrometheusURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parsing %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%q must use http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%q has no host", raw)
+	}
+	return nil
 }

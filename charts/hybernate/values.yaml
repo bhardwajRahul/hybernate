@@ -41,6 +41,9 @@ metrics:
 grafana:
   enabled: false
 
+prometheus:
+  url: "" # required only for PromQL signals, e.g. http://prometheus.monitoring.svc:9090
+
 networkPolicy:
   enabled: false
 
