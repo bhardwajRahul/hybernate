@@ -194,11 +194,13 @@ func (r *Reconciler) captureResourceSnapshot(ctx context.Context, workload *v1al
 	logger := log.FromContext(ctx)
 	snap := &v1alpha1.ResourceSnapshot{Replicas: 1}
 
-	target, err := r.checkTarget(ctx, workload)
+	// Savings are priced on requests, not live usage: requests are what a
+	// pod reserves on a node, and what discovery estimates are based on.
+	replicas, err := r.metrics.Replicas(ctx, workload)
 	if err != nil {
-		logger.V(1).Info("could not fetch target for resource snapshot", "error", err)
-	} else if target != nil {
-		snap.Replicas = replicasFromTarget(target)
+		logger.V(1).Info("could not capture replicas for resource snapshot", "error", err)
+	} else {
+		snap.Replicas = replicas
 	}
 
 	cpuMillis, err := r.metrics.CPURequestPerReplica(ctx, workload)
@@ -208,11 +210,11 @@ func (r *Reconciler) captureResourceSnapshot(ctx context.Context, workload *v1al
 		snap.CPUMillis = int64(cpuMillis)
 	}
 
-	memBytes, err := r.metrics.TotalMemoryBytes(ctx, workload)
+	memBytes, err := r.metrics.MemoryRequestPerReplica(ctx, workload)
 	if err != nil {
 		logger.V(1).Info("could not capture memory for resource snapshot", "error", err)
 	} else {
-		snap.MemoryBytes = int64(memBytes) / int64(snap.Replicas)
+		snap.MemoryBytes = int64(memBytes)
 	}
 
 	pvcBytes, err := r.metrics.TotalPVCBytes(ctx, workload)

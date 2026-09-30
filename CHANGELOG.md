@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The resource snapshot used for savings is persisted before the delete is attempted, so it survives a failed attempt instead of being re-captured from a target that may no longer exist
 - Discovery ranks workloads by their numeric savings. It compared the formatted dollar strings, so `$9.42` ranked above `$11.68`, and in namespaces over 500 workloads the cap kept the wrong ones
 - The discovery summary counts every scanned workload, matching the cost and savings totals, instead of only the first 500
+- Savings for paused and destroyed workloads price memory on the per-replica request, like CPU. The snapshot took CPU from requests but memory from live usage, which skewed savings and disagreed with discovery estimates
+- Taking a resource snapshot no longer panics with an integer divide-by-zero when the target has zero replicas
+- Taking a resource snapshot no longer emits a `TargetNotFound` warning or rewrites the target condition as a side effect
 
 ## [0.1.7] - 2026-04-08
 
