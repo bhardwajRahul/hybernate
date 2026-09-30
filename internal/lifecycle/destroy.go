@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,26 +51,30 @@ func (d *Destroyer) Destroy(ctx context.Context, workload *v1alpha1.ManagedWorkl
 		return true, nil
 	}
 
+	// A missing target counts as destroyed: a previous attempt may have
+	// deleted it and then failed to record that in status.
 	target, err := getTarget(ctx, d.client, workload)
-	if err != nil {
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
 		return false, fmt.Errorf("getting target workload: %w", err)
+	default:
+		if err := d.client.Delete(ctx, target); client.IgnoreNotFound(err) != nil {
+			return false, fmt.Errorf("deleting %s %s: %w", workload.Spec.Target.Kind, target.GetName(), err)
+		}
 	}
 
-	if err := d.client.Delete(ctx, target); err != nil {
-		return false, fmt.Errorf("deleting %s %s: %w", workload.Spec.Target.Kind, target.GetName(), err)
+	// Update in place to keep the resource snapshot the controller recorded
+	// before deleting.
+	if workload.Status.Destroy == nil {
+		workload.Status.Destroy = &v1alpha1.DestroyStatus{}
 	}
-
 	now := d.clock()
-	status := &v1alpha1.DestroyStatus{
-		DestroyedAt: &now,
-	}
-
+	workload.Status.Destroy.DestroyedAt = &now
 	if workload.Spec.Destroy != nil && workload.Spec.Destroy.PVCRetention != nil {
 		expiry := metav1.NewTime(now.Add(workload.Spec.Destroy.PVCRetention.Duration))
-		status.PVCRetentionExpiresAt = &expiry
+		workload.Status.Destroy.PVCRetentionExpiresAt = &expiry
 	}
-
-	workload.Status.Destroy = status
 	return true, nil
 }
 

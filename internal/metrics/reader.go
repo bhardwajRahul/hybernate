@@ -18,6 +18,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -30,6 +31,10 @@ import (
 
 	v1alpha1 "github.com/okedeji/hybernate/api/v1alpha1"
 )
+
+// ErrNoPodMetrics is returned when the Metrics API reports no pods for a
+// workload: it has no running pods, or metrics-server isn't reporting them.
+var ErrNoPodMetrics = errors.New("no pod metrics found")
 
 // Reader reads workload metrics from the Kubernetes Metrics API.
 // All methods aggregate across every pod belonging to the workload
@@ -74,7 +79,7 @@ func (r *Reader) TotalCPUMillis(ctx context.Context, workload *v1alpha1.ManagedW
 	}
 
 	if len(podMetrics.Items) == 0 {
-		return 0, fmt.Errorf("no pod metrics found for %s/%s", workload.Namespace, workload.Spec.Target.Name)
+		return 0, fmt.Errorf("%w for %s/%s", ErrNoPodMetrics, workload.Namespace, workload.Spec.Target.Name)
 	}
 
 	var total float64
@@ -162,7 +167,7 @@ func (r *Reader) TotalMemoryBytes(ctx context.Context, workload *v1alpha1.Manage
 	}
 
 	if len(podMetrics.Items) == 0 {
-		return 0, fmt.Errorf("no pod metrics found for %s/%s", workload.Namespace, workload.Spec.Target.Name)
+		return 0, fmt.Errorf("%w for %s/%s", ErrNoPodMetrics, workload.Namespace, workload.Spec.Target.Name)
 	}
 
 	var total float64

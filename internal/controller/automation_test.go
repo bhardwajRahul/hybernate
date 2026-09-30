@@ -18,19 +18,23 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/okedeji/hybernate/api/v1alpha1"
 	"github.com/okedeji/hybernate/internal/forecast"
+	opmetrics "github.com/okedeji/hybernate/internal/metrics"
 	"github.com/okedeji/hybernate/internal/policy"
 	"github.com/okedeji/hybernate/internal/signal"
 )
@@ -181,7 +185,7 @@ func newAutomationReconciler(t *testing.T, workload *v1alpha1.ManagedWorkload, e
 	r := &Reconciler{
 		Client:          builder.Build(),
 		Scheme:          scheme,
-		Recorder:        record.NewFakeRecorder(10),
+		Recorder:        events.NewFakeRecorder(10),
 		pauser:          opts.pauser,
 		destroyer:       opts.destroyer,
 		lifecycleScaler: opts.lifecycleScaler,
@@ -654,4 +658,83 @@ func TestAutomation_PredictionStatusUpdated(t *testing.T) {
 	assert.Equal(t, "Suggesting", w.Status.Prediction.WeeklyPhase)
 	assert.Equal(t, 91, w.Status.Prediction.DailyConfidence)
 	assert.Equal(t, 72, w.Status.Prediction.WeeklyConfidence)
+}
+
+func metricsCondition(t *testing.T, r *Reconciler) *metav1.Condition {
+	t.Helper()
+	return meta.FindStatusCondition(getWorkload(t, r, "api").Status.Conditions, conditionMetricsAvailable)
+}
+
+func TestAutomation_MissingMetricsSurfacesCondition(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantReason string
+	}{
+		{name: "no pod metrics", err: fmt.Errorf("%w for default/api", opmetrics.ErrNoPodMetrics), wantReason: "NoPodMetrics"},
+		{name: "metrics API down", err: errors.New("the server could not find the requested resource"), wantReason: "MetricsUnavailable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workload := automationWorkload(v1alpha1.PhaseRunning)
+			engine := &stubForecaster{phase: forecast.Observing}
+			r := newAutomationReconciler(t, workload, engine, automationOpts{
+				metrics:   &stubMetrics{err: tt.err, replicas: 2},
+				needsFeed: true,
+			})
+
+			for range 2 {
+				result, err := r.reconcileAutomation(context.Background(), workload)
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, 1*time.Minute, result.RequeueAfter)
+			}
+
+			assert.Equal(t, 0, engine.observeCalls)
+			cond := metricsCondition(t, r)
+			require.NotNil(t, cond, "the user must be able to see why the forecast isn't learning")
+			assert.Equal(t, metav1.ConditionFalse, cond.Status)
+			assert.Equal(t, tt.wantReason, cond.Reason)
+
+			recorder, ok := r.Recorder.(*events.FakeRecorder)
+			require.True(t, ok)
+			assert.Len(t, recorder.Events, 1, "the warning fires once, not on every retry")
+		})
+	}
+}
+
+func TestAutomation_ZeroReplicasFeedsZeroDemand(t *testing.T) {
+	workload := automationWorkload(v1alpha1.PhaseRunning)
+	engine := &stubForecaster{phase: forecast.Observing}
+	r := newAutomationReconciler(t, workload, engine, automationOpts{needsFeed: true})
+	r.metrics = &zeroReplicaMetrics{stubMetrics{err: fmt.Errorf("%w for default/api", opmetrics.ErrNoPodMetrics)}}
+
+	_, err := r.reconcileAutomation(context.Background(), workload)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, engine.observeCalls, "a target scaled to zero is an observation of zero demand")
+	cond := metricsCondition(t, r)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+}
+
+func TestAutomation_MetricsConditionRecovers(t *testing.T) {
+	workload := automationWorkload(v1alpha1.PhaseRunning)
+	engine := &stubForecaster{phase: forecast.Observing}
+	metrics := &stubMetrics{err: fmt.Errorf("%w for default/api", opmetrics.ErrNoPodMetrics), replicas: 2}
+	r := newAutomationReconciler(t, workload, engine, automationOpts{metrics: metrics, needsFeed: true})
+
+	_, err := r.reconcileAutomation(context.Background(), workload)
+	require.NoError(t, err)
+	require.Equal(t, metav1.ConditionFalse, metricsCondition(t, r).Status)
+
+	metrics.err = nil
+	metrics.cpuMillis = 120
+	workload = getWorkload(t, r, "api")
+	_, err = r.reconcileAutomation(context.Background(), workload)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, engine.observeCalls)
+	assert.Equal(t, metav1.ConditionTrue, metricsCondition(t, r).Status)
 }

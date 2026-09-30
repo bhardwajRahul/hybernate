@@ -18,6 +18,7 @@ package discovery
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -213,4 +214,48 @@ func TestScanner_Scan_SortsBySavingsDescending(t *testing.T) {
 
 	assert.Equal(t, "large-idle", result.Discovered[0].Name)
 	assert.Equal(t, "small-idle", result.Discovered[1].Name)
+}
+
+// With default rates, 400m of idle CPU saves about $9.42/month and 500m about
+// $11.68: an ordering that string comparison gets backwards.
+func TestScanner_Scan_SortsByAmountNotString(t *testing.T) {
+	ns := testNamespace
+	objects := []runtime.Object{
+		makeDeployment("nine-dollars", ns, 1, "400m", "128Mi", nil),
+		makePodMetrics("nine-dollars", ns, "1m", "1Mi"),
+		makeDeployment("eleven-dollars", ns, 1, "500m", "128Mi", nil),
+		makePodMetrics("eleven-dollars", ns, "1m", "1Mi"),
+	}
+
+	c := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(objects...).Build()
+	result, err := NewScanner(c).Scan(context.Background(), ns, []v1alpha1.TargetKind{v1alpha1.TargetKindDeployment}, DefaultThresholds())
+	require.NoError(t, err)
+	require.Len(t, result.Discovered, 2)
+
+	require.Equal(t, "$11.68", result.Discovered[0].EstimatedPotentialSavings)
+	assert.Equal(t, "eleven-dollars", result.Discovered[0].Name)
+	assert.Equal(t, "nine-dollars", result.Discovered[1].Name)
+}
+
+func TestScanner_Scan_CapKeepsHighestSavingsAndSummaryCountsAll(t *testing.T) {
+	ns := testNamespace
+	objects := make([]runtime.Object, 0, 2*(maxDiscovered+1))
+	for i := range maxDiscovered {
+		name := fmt.Sprintf("small-%03d", i)
+		objects = append(objects,
+			makeDeployment(name, ns, 1, "400m", "128Mi", nil),
+			makePodMetrics(name, ns, "1m", "1Mi"))
+	}
+	objects = append(objects,
+		makeDeployment("biggest", ns, 1, "500m", "128Mi", nil),
+		makePodMetrics("biggest", ns, "1m", "1Mi"))
+
+	c := fake.NewClientBuilder().WithScheme(newScheme()).WithRuntimeObjects(objects...).Build()
+	result, err := NewScanner(c).Scan(context.Background(), ns, []v1alpha1.TargetKind{v1alpha1.TargetKindDeployment}, DefaultThresholds())
+	require.NoError(t, err)
+
+	require.Len(t, result.Discovered, maxDiscovered)
+	assert.Equal(t, "biggest", result.Discovered[0].Name, "the cap must keep the highest-savings workloads")
+	assert.Equal(t, maxDiscovered+1, result.Summary.Total, "summary counts every scanned workload, not just the capped list")
+	assert.Equal(t, maxDiscovered+1, result.Summary.Idle)
 }

@@ -122,6 +122,26 @@ func TestPrometheus_Unreachable(t *testing.T) {
 	assert.Contains(t, err.Error(), "querying prometheus")
 }
 
+func TestPrometheus_EndpointNotConfigured(t *testing.T) {
+	p := NewPrometheus("", `up`)
+	_, err := p.Check(context.Background(), "staging", "api")
+
+	require.ErrorIs(t, err, ErrEndpointNotConfigured)
+}
+
+func TestPrometheus_PreservesEndpointPathPrefix(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/prometheus/api/v1/query", r.URL.Path)
+		_, _ = w.Write([]byte(`{"status": "success", "data": {"resultType": "vector", "result": []}}`))
+	}))
+	defer srv.Close()
+
+	p := NewPrometheus(srv.URL+"/prometheus", `up`)
+	_, err := p.Check(context.Background(), "staging", "api")
+
+	require.NoError(t, err)
+}
+
 func TestPrometheus_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`not json`))

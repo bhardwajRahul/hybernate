@@ -44,6 +44,9 @@ spec:
             {{- end }}
             {{- end }}
             - --zap-log-level={{ .Values.logLevel }}
+            {{- with .Values.prometheus.url }}
+            - --prometheus-url={{ . }}
+            {{- end }}
           ports:
             {{- if .Values.metrics.enabled }}
             - name: metrics

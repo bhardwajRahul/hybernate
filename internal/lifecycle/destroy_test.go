@@ -207,3 +207,28 @@ func TestCleanupPVCs_NoRetentionExpiryIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, done)
 }
+
+func TestDestroy_TargetAlreadyGoneCountsAsDestroyed(t *testing.T) {
+	d, dep, workload := newTestDestroyer(t)
+	require.NoError(t, d.client.Delete(context.Background(), dep))
+
+	done, err := d.Destroy(context.Background(), workload)
+
+	require.NoError(t, err)
+	assert.True(t, done)
+	require.NotNil(t, workload.Status.Destroy)
+	assert.NotNil(t, workload.Status.Destroy.DestroyedAt)
+}
+
+func TestDestroy_KeepsResourceSnapshot(t *testing.T) {
+	d, _, workload := newTestDestroyer(t)
+	snapshot := &v1alpha1.ResourceSnapshot{Replicas: 3, CPUMillis: 500, MemoryBytes: 256 << 20}
+	workload.Status.Destroy = &v1alpha1.DestroyStatus{Resources: snapshot}
+
+	done, err := d.Destroy(context.Background(), workload)
+
+	require.NoError(t, err)
+	assert.True(t, done)
+	assert.Equal(t, snapshot, workload.Status.Destroy.Resources)
+	assert.NotNil(t, workload.Status.Destroy.DestroyedAt)
+}

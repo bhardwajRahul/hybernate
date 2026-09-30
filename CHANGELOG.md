@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Events are emitted through the `events.k8s.io/v1` API (`events.EventRecorder`) instead of the deprecated `record.EventRecorder`. Each event now carries an action (e.g. `Pause`, `EvaluateIdle`, `CheckDrift`). The operator's ClusterRole gains `create`/`patch` on `events.k8s.io` events; the Helm chart and kustomize RBAC include it
+
+### Fixed
+
+- Prometheus signals now work. The operator never received a Prometheus URL, and signal checkers were built without an HTTP client, so any workload with `idlePolicy.signals` or `scalePolicy.down.guard` panicked on evaluation. Configure the endpoint with the new `--prometheus-url` flag (Helm value `prometheus.url`); the documented `PROMETHEUS_ENDPOINT` environment variable was never read and is removed from the docs
+- Prometheus endpoints served under a path prefix (Thanos, Mimir, reverse proxies) no longer have their prefix replaced by `/api/v1/query`
+- Evaluating a Prometheus signal without a configured endpoint now fails with a clear `prometheus endpoint not configured` error
+- Two ManagedWorkloads targeting the same workload no longer block each other. The duplicate check OR'd the UID tie-breaker in unconditionally, so when the older CR had the larger UID both were marked `DuplicateTarget` and neither managed the target. The oldest CR now always wins, with UID breaking ties only for CRs created in the same second
+- A blocked duplicate now takes over when the owning ManagedWorkload is deleted. Previously it was never reconciled again, so it stayed blocked until something else touched it
+- The `DuplicateTarget` warning event fires once when the conflict is detected, not on every recheck
+- Workloads no longer get stuck in `Pausing`, `Resuming`, or `Destroying` after a transient failure. These intermediate phases were persisted before the action ran, and nothing acted on them afterwards, so one failed API call stranded the workload for good. Interrupted transitions are now retried until they finish
+- Destroy is idempotent: a target that is already gone counts as destroyed, so a delete that succeeded before its status update failed no longer errors on every retry
+- The resource snapshot used for savings is persisted before the delete is attempted, so it survives a failed attempt instead of being re-captured from a target that may no longer exist
+- Discovery ranks workloads by their numeric savings. It compared the formatted dollar strings, so `$9.42` ranked above `$11.68`, and in namespaces over 500 workloads the cap kept the wrong ones
+- The discovery summary counts every scanned workload, matching the cost and savings totals, instead of only the first 500
+- Savings for paused and destroyed workloads price memory on the per-replica request, like CPU. The snapshot took CPU from requests but memory from live usage, which skewed savings and disagreed with discovery estimates
+- Taking a resource snapshot no longer panics with an integer divide-by-zero when the target has zero replicas
+- Taking a resource snapshot no longer emits a `TargetNotFound` warning or rewrites the target condition as a side effect
+- Workloads no longer sit in `Observing` indefinitely with no explanation when CPU metrics can't be read (#10). A new `MetricsAvailable` condition reports `NoPodMetrics` or `MetricsUnavailable` with the cause, and a warning event fires when it first fails
+- A target scaled to zero replicas feeds the forecast an observation of zero demand instead of being treated as missing data
+- Status conditions now update their reason and message when the cause changes, even if the status stays the same
+- A change to a Deployment only re-queues ManagedWorkloads that target that Deployment, and likewise for StatefulSets. The target watch matched on name alone, so a Deployment and a StatefulSet with the same name re-queued each other's ManagedWorkloads
+
 ## [0.1.7] - 2026-04-08
 
 ### Fixed

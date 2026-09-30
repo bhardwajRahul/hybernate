@@ -57,7 +57,7 @@ func (s *Scanner) Scan(ctx context.Context, namespace string, kinds []v1alpha1.T
 		return nil, fmt.Errorf("listing managed workloads: %w", err)
 	}
 
-	var all []v1alpha1.DiscoveredWorkload
+	var ranked []rankedWorkload
 	var totalSavings, totalCost float64
 
 	for _, kind := range kinds {
@@ -73,21 +73,44 @@ func (s *Scanner) Scan(ctx context.Context, namespace string, kinds []v1alpha1.T
 			}
 
 			d := BuildDiscovered(info, th)
-			totalSavings += EstimateSavings(info, d.Classification, th)
+			savings := EstimateSavings(info, d.Classification, th)
+			totalSavings += savings
 			totalCost += EstimateMonthlyCost(info, th.Rates)
-			all = append(all, d)
+			ranked = append(ranked, rankedWorkload{DiscoveredWorkload: d, savings: savings})
 		}
 	}
 
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].EstimatedPotentialSavings > all[j].EstimatedPotentialSavings
+	// Sort on the numeric amount: the formatted strings compare
+	// lexicographically, which ranks "$9.00" above "$10.00". Kind and name
+	// break ties so the status list doesn't reshuffle between scans.
+	sort.Slice(ranked, func(i, j int) bool {
+		a, b := ranked[i], ranked[j]
+		if a.savings != b.savings {
+			return a.savings > b.savings
+		}
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		return a.Name < b.Name
 	})
+
+	all := make([]v1alpha1.DiscoveredWorkload, len(ranked))
+	for i := range ranked {
+		all[i] = ranked[i].DiscoveredWorkload
+	}
+
+	// Summarize before capping so counts cover the same workloads as the
+	// cost and savings totals.
+	summary := buildSummary(all, totalCost, totalSavings)
 	if len(all) > maxDiscovered {
 		all = all[:maxDiscovered]
 	}
-
-	summary := buildSummary(all, totalCost, totalSavings)
 	return &ScanResult{Discovered: all, Summary: summary}, nil
+}
+
+type rankedWorkload struct {
+	v1alpha1.DiscoveredWorkload
+	savings float64
 }
 
 func (s *Scanner) listWorkloads(ctx context.Context, namespace string, kind v1alpha1.TargetKind) ([]client.Object, error) {

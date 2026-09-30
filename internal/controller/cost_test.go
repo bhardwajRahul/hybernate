@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 
 	v1alpha1 "github.com/okedeji/hybernate/api/v1alpha1"
 )
@@ -304,4 +305,52 @@ func TestAccumulateCost_CustomRates(t *testing.T) {
 
 	defaultCost := parseDollarAmount(wDefault.Status.Cost.EstimatedCostWithoutManagement)
 	assert.Greater(t, costWithout, defaultCost, "custom rate ($0.10) should cost more than default ($0.031)")
+}
+
+type zeroReplicaMetrics struct{ stubMetrics }
+
+func (*zeroReplicaMetrics) Replicas(_ context.Context, _ *v1alpha1.ManagedWorkload) (int32, error) {
+	return 0, nil
+}
+
+func TestCaptureResourceSnapshot_PricesMemoryOnRequest(t *testing.T) {
+	workload := costWorkload(v1alpha1.PhaseRunning)
+	r := newTestReconciler(t, workload, &stubPauser{}, &stubDestroyer{})
+	r.metrics = &stubMetrics{
+		cpuPerReplica:    500,
+		memoryPerReplica: 512 << 20,
+		memoryBytes:      96 << 20, // live usage across all pods, deliberately far from the request
+		replicas:         3,
+	}
+
+	snap := r.captureResourceSnapshot(context.Background(), workload)
+
+	require.NotNil(t, snap)
+	assert.Equal(t, int32(3), snap.Replicas)
+	assert.Equal(t, int64(500), snap.CPUMillis)
+	assert.Equal(t, int64(512<<20), snap.MemoryBytes, "memory per replica must come from the request, like CPU")
+}
+
+func TestCaptureResourceSnapshot_ZeroReplicas(t *testing.T) {
+	workload := costWorkload(v1alpha1.PhaseRunning)
+	r := newTestReconcilerWithReplicas(t, workload, &stubPauser{}, &stubDestroyer{}, 0)
+	r.metrics = &zeroReplicaMetrics{stubMetrics{cpuPerReplica: 500, memoryPerReplica: 512 << 20, memoryBytes: 64 << 20}}
+
+	snap := r.captureResourceSnapshot(context.Background(), workload)
+
+	require.NotNil(t, snap)
+	assert.Equal(t, int32(0), snap.Replicas)
+	assert.Equal(t, int64(512<<20), snap.MemoryBytes)
+}
+
+func TestCaptureResourceSnapshot_MissingTargetEmitsNoEvent(t *testing.T) {
+	workload := costWorkload(v1alpha1.PhaseRunning)
+	r := newTestReconcilerWithTarget(t, workload, &stubPauser{}, &stubDestroyer{}, false)
+	r.metrics = &stubMetrics{cpuPerReplica: 500, memoryPerReplica: 512 << 20}
+
+	r.captureResourceSnapshot(context.Background(), workload)
+
+	recorder, ok := r.Recorder.(*events.FakeRecorder)
+	require.True(t, ok)
+	assert.Empty(t, recorder.Events, "capturing a snapshot must not report TargetNotFound as a side effect")
 }

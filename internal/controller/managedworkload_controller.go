@@ -23,10 +23,11 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -44,13 +45,18 @@ import (
 const (
 	finalizerName            = v1alpha1.FinalizerCleanup
 	conditionDuplicateTarget = "DuplicateTarget"
+
+	// duplicateRecheckInterval is a safety net for a blocked duplicate. Owner
+	// deletion re-triggers it immediately via the sibling watch, but an owner
+	// that is retargeted only emits an event carrying its new target.
+	duplicateRecheckInterval = 5 * time.Minute
 )
 
 // Reconciler drives ManagedWorkload objects through their lifecycle.
 type Reconciler struct {
 	client.Client
 	Scheme        *runtime.Scheme
-	Recorder      record.EventRecorder
+	Recorder      events.EventRecorder
 	PrometheusURL string
 
 	pauser          lifecyclePauser
@@ -82,6 +88,7 @@ type lifecycleDestroyer interface {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile evaluates the current state of a ManagedWorkload and acts on it.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, retErr error) {
@@ -110,7 +117,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	if duplicate, err := r.checkDuplicate(ctx, &workload); err != nil {
 		return ctrl.Result{}, fmt.Errorf("checking duplicate target: %w", err)
 	} else if duplicate {
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: duplicateRecheckInterval}, nil
 	}
 
 	// Set initial phase.
@@ -136,9 +143,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		}
 	}
 
+	// --- In-flight transitions ---
+
+	result, err := r.resumeTransition(ctx, &workload)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if result != nil {
+		return *result, nil
+	}
+
 	// --- Manual lifecycle ---
 
-	result, err := r.reconcileDesiredState(ctx, &workload)
+	result, err = r.reconcileDesiredState(ctx, &workload)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -174,6 +191,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 
 	logger.Info("reconciled", "phase", workload.Status.Phase)
 	return ctrl.Result{}, nil
+}
+
+// resumeTransition finishes a pause, resume, or destroy that an earlier
+// reconcile started but didn't complete. Without it, a transient failure
+// strands the workload in the intermediate phase, because neither the manual
+// nor the automated paths act on Pausing, Resuming, or Destroying.
+func (r *Reconciler) resumeTransition(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {
+	switch workload.Status.Phase {
+	case v1alpha1.PhasePausing:
+		return r.handlePause(ctx, workload)
+	case v1alpha1.PhaseResuming:
+		return r.handleResume(ctx, workload)
+	case v1alpha1.PhaseDestroying:
+		return r.handleDestroy(ctx, workload)
+	default:
+		return nil, nil
+	}
 }
 
 func (r *Reconciler) reconcileDesiredState(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {
@@ -232,7 +266,7 @@ func (r *Reconciler) handlePause(ctx context.Context, workload *v1alpha1.Managed
 	if err != nil {
 		return nil, err
 	}
-	r.emitEvent(workload, false, "Normal", ReasonPaused, "paused")
+	r.emitEvent(workload, false, "Normal", ReasonPaused, actionPause, "paused")
 	return &result, nil
 }
 
@@ -266,24 +300,26 @@ func (r *Reconciler) handleResume(ctx context.Context, workload *v1alpha1.Manage
 	if err != nil {
 		return nil, err
 	}
-	r.emitEvent(workload, false, "Normal", ReasonResumed, "resumed")
+	r.emitEvent(workload, false, "Normal", ReasonResumed, actionResume, "resumed")
 	return &result, nil
 }
 
 func (r *Reconciler) handleDestroy(ctx context.Context, workload *v1alpha1.ManagedWorkload) (*ctrl.Result, error) {
-	phase := workload.Status.Phase
-	if phase == v1alpha1.PhaseDestroyed {
+	switch workload.Status.Phase {
+	case v1alpha1.PhaseDestroyed:
 		return nil, nil
-	}
-	if phase == v1alpha1.PhaseDestroying {
-		return nil, nil
-	}
-
-	// Capture resource profile before deletion for cost savings tracking.
-	snap := r.captureResourceSnapshot(ctx, workload)
-
-	if _, err := r.transition(ctx, workload, v1alpha1.PhaseDestroying, "DestroyRequested"); err != nil {
-		return nil, err
+	case v1alpha1.PhaseDestroying:
+		// Retrying: the snapshot was persisted with the Destroying phase, and
+		// the target may already be gone, so don't capture it again.
+	default:
+		// Persist the snapshot with the phase so it survives a failed delete.
+		if workload.Status.Destroy == nil {
+			workload.Status.Destroy = &v1alpha1.DestroyStatus{}
+		}
+		workload.Status.Destroy.Resources = r.captureResourceSnapshot(ctx, workload)
+		if _, err := r.transition(ctx, workload, v1alpha1.PhaseDestroying, "DestroyRequested"); err != nil {
+			return nil, err
+		}
 	}
 
 	done, err := r.destroyer.Destroy(ctx, workload)
@@ -297,15 +333,11 @@ func (r *Reconciler) handleDestroy(ctx context.Context, workload *v1alpha1.Manag
 
 	r.stampLastActed(workload)
 	r.observeActionDuration(workload, "destroy")
-	if workload.Status.Destroy == nil {
-		workload.Status.Destroy = &v1alpha1.DestroyStatus{}
-	}
-	workload.Status.Destroy.Resources = snap
 	result, err := r.transition(ctx, workload, v1alpha1.PhaseDestroyed, "Destroyed")
 	if err != nil {
 		return nil, err
 	}
-	r.emitEvent(workload, false, "Normal", ReasonDestroyed, "destroyed")
+	r.emitEvent(workload, false, "Normal", ReasonDestroyed, actionDestroy, "destroyed")
 	return &result, nil
 }
 
@@ -347,7 +379,7 @@ func (r *Reconciler) checkPauseExpiry(ctx context.Context, workload *v1alpha1.Ma
 		return &result, nil
 	}
 
-	r.emitEvent(workload, false, "Normal", ReasonPauseExpired,
+	r.emitEvent(workload, false, "Normal", ReasonPauseExpired, actionExpirePause,
 		"pause expired after %s, executing %s", workload.Spec.Pause.ExpireAfter.Duration, workload.Spec.Pause.ExpireAction)
 
 	switch workload.Spec.Pause.ExpireAction {
@@ -376,7 +408,7 @@ func (r *Reconciler) checkPVCRetention(ctx context.Context, workload *v1alpha1.M
 		if err := r.Status().Update(ctx, workload); err != nil {
 			return nil, fmt.Errorf("cancelling pvc retention: %w", err)
 		}
-		r.emitEvent(workload, false, "Normal", ReasonPVCRetentionExpiring,
+		r.emitEvent(workload, false, "Normal", ReasonPVCRetentionExpiring, actionCleanupPVCs,
 			"PVC retention removed from spec, cleanup cancelled")
 		return nil, nil
 	}
@@ -404,7 +436,7 @@ func (r *Reconciler) checkPVCRetention(ctx context.Context, workload *v1alpha1.M
 		return nil, fmt.Errorf("updating status after pvc cleanup: %w", err)
 	}
 
-	r.emitEvent(workload, false, "Normal", ReasonPVCsCleaned, "PVCs cleaned up after retention period")
+	r.emitEvent(workload, false, "Normal", ReasonPVCsCleaned, actionCleanupPVCs, "PVCs cleaned up after retention period")
 	result := ctrl.Result{}
 	return &result, nil
 }
@@ -430,7 +462,7 @@ func (r *Reconciler) checkPVCRetentionWarning(_ context.Context, workload *v1alp
 	}
 
 	remaining := expiry.Sub(now).Round(time.Minute)
-	r.emitEvent(workload, false, "Warning", ReasonPVCRetentionExpiring,
+	r.emitEvent(workload, false, "Warning", ReasonPVCRetentionExpiring, actionCleanupPVCs,
 		"PVCs will be deleted in %s", remaining)
 
 	return nil, nil
@@ -478,7 +510,10 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, workload *v1alpha1.Man
 
 // --- Target ---
 
-const conditionTargetAvailable = "TargetAvailable"
+const (
+	conditionTargetAvailable  = "TargetAvailable"
+	conditionMetricsAvailable = "MetricsAvailable"
+)
 
 // checkTarget verifies the target workload exists. Returns the target object
 // on success, nil when not found (condition set, status updated), or an error.
@@ -503,7 +538,7 @@ func (r *Reconciler) checkTarget(ctx context.Context, workload *v1alpha1.Managed
 		if err := r.Status().Update(ctx, workload); err != nil {
 			return nil, fmt.Errorf("updating target condition: %w", err)
 		}
-		r.emitEvent(workload, false, "Warning", "TargetNotFound",
+		r.emitEvent(workload, false, "Warning", ReasonTargetNotFound, actionCheckTarget,
 			"%s %s not found", ref.Kind, ref.Name)
 		metrics.TargetUnavailable.WithLabelValues(workload.Namespace, workload.Spec.Target.Name).Inc()
 		return nil, nil
@@ -544,7 +579,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, workload *v1alpha1.ManagedW
 
 	action := resolveConflictAction(workload)
 	metrics.DriftDetections.WithLabelValues(string(action)).Inc()
-	r.emitEvent(workload, false, "Warning", ReasonDriftDetected,
+	r.emitEvent(workload, false, "Warning", ReasonDriftDetected, actionCheckDrift,
 		"replicas changed externally from %d to %d, policy: %s", expected, actual, action)
 
 	switch action {
@@ -556,7 +591,7 @@ func (r *Reconciler) checkDrift(ctx context.Context, workload *v1alpha1.ManagedW
 		if err := r.Status().Update(ctx, workload); err != nil {
 			return nil, fmt.Errorf("updating status after drift correction: %w", err)
 		}
-		r.emitEvent(workload, false, "Normal", ReasonDriftCorrected,
+		r.emitEvent(workload, false, "Normal", ReasonDriftCorrected, actionCorrectDrift,
 			"replicas corrected from %d back to %d", actual, expected)
 
 	case v1alpha1.ConflictActionDefer:
@@ -618,24 +653,12 @@ func (r *Reconciler) acceptDrift(workload *v1alpha1.ManagedWorkload, actual int3
 }
 
 func (r *Reconciler) setCondition(workload *v1alpha1.ManagedWorkload, condType string, status metav1.ConditionStatus, reason, message string) {
-	now := r.clockTime()
-	for i, c := range workload.Status.Conditions {
-		if c.Type == condType {
-			if c.Status != status {
-				workload.Status.Conditions[i].Status = status
-				workload.Status.Conditions[i].Reason = reason
-				workload.Status.Conditions[i].Message = message
-				workload.Status.Conditions[i].LastTransitionTime = now
-			}
-			return
-		}
-	}
-	workload.Status.Conditions = append(workload.Status.Conditions, metav1.Condition{
+	meta.SetStatusCondition(&workload.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
-		LastTransitionTime: now,
+		LastTransitionTime: r.clockTime(),
 	})
 }
 
@@ -648,21 +671,25 @@ func (r *Reconciler) checkDuplicate(ctx context.Context, workload *v1alpha1.Mana
 		return false, fmt.Errorf("listing managed workloads: %w", err)
 	}
 
-	for _, other := range list.Items {
-		if other.UID == workload.UID {
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.UID == workload.UID || !other.DeletionTimestamp.IsZero() {
 			continue
 		}
-		if other.Spec.Target.Kind == workload.Spec.Target.Kind && other.Spec.Target.Name == workload.Spec.Target.Name {
-			if other.CreationTimestamp.Before(&workload.CreationTimestamp) || other.UID < workload.UID {
-				msg := fmt.Sprintf("%s/%s is already managed by %s", workload.Spec.Target.Kind, workload.Spec.Target.Name, other.Name)
-				r.setCondition(workload, conditionDuplicateTarget, metav1.ConditionTrue, conditionDuplicateTarget, msg)
-				r.Recorder.Event(workload, "Warning", conditionDuplicateTarget, msg)
-				if err := r.Status().Update(ctx, workload); err != nil {
-					return false, fmt.Errorf("updating duplicate condition: %w", err)
-				}
-				return true, nil
-			}
+		if other.Spec.Target != workload.Spec.Target || !claimsTargetFirst(other, workload) {
+			continue
 		}
+
+		msg := fmt.Sprintf("%s/%s is already managed by %s", workload.Spec.Target.Kind, workload.Spec.Target.Name, other.Name)
+		alreadyFlagged := meta.IsStatusConditionTrue(workload.Status.Conditions, conditionDuplicateTarget)
+		r.setCondition(workload, conditionDuplicateTarget, metav1.ConditionTrue, conditionDuplicateTarget, msg)
+		if err := r.Status().Update(ctx, workload); err != nil {
+			return false, fmt.Errorf("updating duplicate condition: %w", err)
+		}
+		if !alreadyFlagged {
+			r.Recorder.Eventf(workload, nil, "Warning", conditionDuplicateTarget, actionCheckDuplicate, "%s", msg)
+		}
+		return true, nil
 	}
 
 	// Clear the condition if it was previously set and the conflict is gone.
@@ -682,15 +709,73 @@ func (r *Reconciler) checkDuplicate(ctx context.Context, workload *v1alpha1.Mana
 	return false, nil
 }
 
+// claimsTargetFirst reports whether a owns a shared target ahead of b. The
+// oldest ManagedWorkload wins. Creation timestamps have one-second precision,
+// so UID breaks ties between objects created in the same second.
+func claimsTargetFirst(a, b *v1alpha1.ManagedWorkload) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.UID < b.UID
+}
+
+// findWorkloadsSharingTarget enqueues the other ManagedWorkloads that target
+// the same workload, so a blocked duplicate takes over as soon as the owner
+// is deleted.
+func (r *Reconciler) findWorkloadsSharingTarget(ctx context.Context, obj client.Object) []reconcile.Request {
+	changed, ok := obj.(*v1alpha1.ManagedWorkload)
+	if !ok {
+		return nil
+	}
+
+	var list v1alpha1.ManagedWorkloadList
+	if err := r.List(ctx, &list, client.InNamespace(changed.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "listing managed workloads sharing a target",
+			"workload", changed.Name, "namespace", changed.Namespace)
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, w := range list.Items {
+		if w.UID != changed.UID && w.Spec.Target == changed.Spec.Target {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: w.Name, Namespace: w.Namespace},
+			})
+		}
+	}
+	return requests
+}
+
+// targetRefFor identifies a watched object as a ManagedWorkload target.
+// Typed objects from the cache carry no GVK, so the kind comes from the Go
+// type rather than obj.GetObjectKind().
+func targetRefFor(obj client.Object) (v1alpha1.WorkloadRef, bool) {
+	switch obj.(type) {
+	case *appsv1.Deployment:
+		return v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: obj.GetName()}, true
+	case *appsv1.StatefulSet:
+		return v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindStatefulSet, Name: obj.GetName()}, true
+	default:
+		return v1alpha1.WorkloadRef{}, false
+	}
+}
+
 func (r *Reconciler) findWorkloadsForTarget(ctx context.Context, obj client.Object) []reconcile.Request {
+	target, ok := targetRefFor(obj)
+	if !ok {
+		return nil
+	}
+
 	var workloads v1alpha1.ManagedWorkloadList
 	if err := r.List(ctx, &workloads, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.FromContext(ctx).Error(err, "listing managed workloads for target",
+			"target", target.Name, "kind", target.Kind, "namespace", obj.GetNamespace())
 		return nil
 	}
 
 	var requests []reconcile.Request
 	for _, w := range workloads.Items {
-		if w.Spec.Target.Name == obj.GetName() {
+		if w.Spec.Target == target {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: w.Name, Namespace: w.Namespace},
 			})
@@ -769,6 +854,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	targetHandler := handler.EnqueueRequestsFromMapFunc(r.findWorkloadsForTarget)
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.ManagedWorkload{}).
+		Watches(&v1alpha1.ManagedWorkload{}, handler.EnqueueRequestsFromMapFunc(r.findWorkloadsSharingTarget)).
 		Watches(&appsv1.Deployment{}, targetHandler).
 		Watches(&appsv1.StatefulSet{}, targetHandler).
 		Named("managedworkload").

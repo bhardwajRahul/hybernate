@@ -18,17 +18,20 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -109,7 +112,7 @@ func newTestReconcilerWithReplicas(t *testing.T, workload *v1alpha1.ManagedWorkl
 	return &Reconciler{
 		Client:    builder.Build(),
 		Scheme:    scheme,
-		Recorder:  record.NewFakeRecorder(10),
+		Recorder:  events.NewFakeRecorder(10),
 		pauser:    pauser,
 		destroyer: destroyer,
 		engines:   newEngineRegistry(func(_ int) forecaster { return &stubForecaster{} }),
@@ -137,7 +140,7 @@ func newTestReconcilerWithTarget(t *testing.T, workload *v1alpha1.ManagedWorkloa
 	return &Reconciler{
 		Client:    builder.Build(),
 		Scheme:    scheme,
-		Recorder:  record.NewFakeRecorder(10),
+		Recorder:  events.NewFakeRecorder(10),
 		pauser:    pauser,
 		destroyer: destroyer,
 		engines:   newEngineRegistry(func(_ int) forecaster { return &stubForecaster{} }),
@@ -763,7 +766,7 @@ func TestReconcile_DuplicateTargetBlocksNewer(t *testing.T) {
 	}
 
 	scheme := testScheme(t)
-	recorder := record.NewFakeRecorder(10)
+	recorder := events.NewFakeRecorder(10)
 	k := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&v1alpha1.ManagedWorkload{}).
@@ -846,7 +849,7 @@ func TestReconcile_DuplicateTargetAllowsOlder(t *testing.T) {
 	r := &Reconciler{
 		Client:    k,
 		Scheme:    scheme,
-		Recorder:  record.NewFakeRecorder(10),
+		Recorder:  events.NewFakeRecorder(10),
 		pauser:    &stubPauser{},
 		destroyer: &stubDestroyer{},
 		engines:   newEngineRegistry(func(_ int) forecaster { return &stubForecaster{} }),
@@ -901,7 +904,7 @@ func TestReconcile_DuplicateTargetClearsWhenResolved(t *testing.T) {
 	r := &Reconciler{
 		Client:    k,
 		Scheme:    scheme,
-		Recorder:  record.NewFakeRecorder(10),
+		Recorder:  events.NewFakeRecorder(10),
 		pauser:    &stubPauser{},
 		destroyer: &stubDestroyer{},
 		engines:   newEngineRegistry(func(_ int) forecaster { return &stubForecaster{} }),
@@ -917,5 +920,232 @@ func TestReconcile_DuplicateTargetClearsWhenResolved(t *testing.T) {
 		if c.Type == "DuplicateTarget" {
 			assert.Equal(t, metav1.ConditionFalse, c.Status, "condition should be cleared")
 		}
+	}
+}
+
+func sharedTargetWorkload(name string, uid types.UID, created time.Time) *v1alpha1.ManagedWorkload {
+	return &v1alpha1.ManagedWorkload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			UID:               uid,
+			CreationTimestamp: metav1.NewTime(created),
+			Finalizers:        []string{finalizerName},
+		},
+		Spec: v1alpha1.ManagedWorkloadSpec{
+			Target:     v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: "idle-app"},
+			Prediction: v1alpha1.PredictionSpec{Confidence: 85},
+		},
+	}
+}
+
+func newSharedTargetReconciler(t *testing.T, objs ...client.Object) (*Reconciler, *events.FakeRecorder) {
+	t.Helper()
+	scheme := testScheme(t)
+	recorder := events.NewFakeRecorder(10)
+	k := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1alpha1.ManagedWorkload{}).
+		WithObjects(append(objs, targetDeployment("idle-app", "default"))...).
+		Build()
+	return &Reconciler{
+		Client:    k,
+		Scheme:    scheme,
+		Recorder:  recorder,
+		pauser:    &stubPauser{},
+		destroyer: &stubDestroyer{},
+		engines:   newEngineRegistry(func(_ int) forecaster { return &stubForecaster{} }),
+		clock:     func() time.Time { return fixedTime },
+	}, recorder
+}
+
+func isDuplicate(t *testing.T, r *Reconciler, name string) bool {
+	t.Helper()
+	return meta.IsStatusConditionTrue(getWorkload(t, r, name).Status.Conditions, conditionDuplicateTarget)
+}
+
+func TestReconcile_DuplicateTargetExactlyOneOwner(t *testing.T) {
+	tests := []struct {
+		name      string
+		olderUID  types.UID
+		newerUID  types.UID
+		sameTime  bool
+		wantOwner string
+	}{
+		{name: "older has smaller UID", olderUID: "aaa", newerUID: "zzz", wantOwner: "older"},
+		{name: "older has larger UID", olderUID: "zzz", newerUID: "aaa", wantOwner: "older"},
+		{name: "same second, smaller UID wins", olderUID: "zzz", newerUID: "aaa", sameTime: true, wantOwner: "newer"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newerCreated := fixedTime
+			if tt.sameTime {
+				newerCreated = fixedTime.Add(-1 * time.Hour)
+			}
+			older := sharedTargetWorkload("older", tt.olderUID, fixedTime.Add(-1*time.Hour))
+			newer := sharedTargetWorkload("newer", tt.newerUID, newerCreated)
+			r, _ := newSharedTargetReconciler(t, older, newer)
+
+			for _, name := range []string{"older", "newer"} {
+				_, err := r.Reconcile(context.Background(), reconcileFor(name))
+				require.NoError(t, err)
+			}
+
+			assert.NotEqual(t, isDuplicate(t, r, "older"), isDuplicate(t, r, "newer"),
+				"exactly one workload must own the target")
+			assert.False(t, isDuplicate(t, r, tt.wantOwner), "%s should own the target", tt.wantOwner)
+		})
+	}
+}
+
+func TestReconcile_DuplicateTakesOverWhenOwnerIsDeleting(t *testing.T) {
+	owner := sharedTargetWorkload("older", "aaa", fixedTime.Add(-1*time.Hour))
+	deleting := metav1.NewTime(fixedTime)
+	owner.DeletionTimestamp = &deleting
+	duplicate := sharedTargetWorkload("newer", "bbb", fixedTime)
+	r, _ := newSharedTargetReconciler(t, owner, duplicate)
+
+	_, err := r.Reconcile(context.Background(), reconcileFor("newer"))
+	require.NoError(t, err)
+
+	assert.False(t, isDuplicate(t, r, "newer"))
+}
+
+func TestReconcile_DuplicateRequeuesAndWarnsOnce(t *testing.T) {
+	owner := sharedTargetWorkload("older", "aaa", fixedTime.Add(-1*time.Hour))
+	duplicate := sharedTargetWorkload("newer", "bbb", fixedTime)
+	r, recorder := newSharedTargetReconciler(t, owner, duplicate)
+
+	for range 2 {
+		result, err := r.Reconcile(context.Background(), reconcileFor("newer"))
+		require.NoError(t, err)
+		assert.Equal(t, duplicateRecheckInterval, result.RequeueAfter)
+	}
+
+	assert.Len(t, recorder.Events, 1, "duplicate warning should only fire when first detected")
+}
+
+func TestFindWorkloadsSharingTarget(t *testing.T) {
+	owner := sharedTargetWorkload("older", "aaa", fixedTime.Add(-1*time.Hour))
+	duplicate := sharedTargetWorkload("newer", "bbb", fixedTime)
+	unrelated := sharedTargetWorkload("other", "ccc", fixedTime)
+	unrelated.Spec.Target.Name = "other-app"
+	r, _ := newSharedTargetReconciler(t, owner, duplicate, unrelated)
+
+	requests := r.findWorkloadsSharingTarget(context.Background(), owner)
+
+	assert.Equal(t, []reconcile.Request{reconcileFor("newer")}, requests)
+}
+
+func lifecycleWorkload(name string, desired *v1alpha1.DesiredState, phase v1alpha1.WorkloadPhase) *v1alpha1.ManagedWorkload {
+	return &v1alpha1.ManagedWorkload{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: v1alpha1.ManagedWorkloadSpec{
+			Target:       v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: name},
+			DesiredState: desired,
+		},
+		Status: v1alpha1.ManagedWorkloadStatus{Phase: phase},
+	}
+}
+
+func TestReconcile_ResumesInterruptedTransition(t *testing.T) {
+	tests := []struct {
+		name      string
+		phase     v1alpha1.WorkloadPhase
+		wantPhase v1alpha1.WorkloadPhase
+	}{
+		{name: "pause", phase: v1alpha1.PhasePausing, wantPhase: v1alpha1.PhasePaused},
+		{name: "resume", phase: v1alpha1.PhaseResuming, wantPhase: v1alpha1.PhaseRunning},
+		{name: "destroy", phase: v1alpha1.PhaseDestroying, wantPhase: v1alpha1.PhaseDestroyed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// No desiredState: this is the automated path, where nothing
+			// else would pick the transition back up.
+			workload := lifecycleWorkload("stuck-app", nil, tt.phase)
+			pauser := &stubPauser{pauseDone: true, resumeDone: true}
+			destroyer := &stubDestroyer{destroyDone: true}
+			r := newTestReconciler(t, workload, pauser, destroyer)
+
+			_, err := r.Reconcile(context.Background(), reconcileFor("stuck-app"))
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantPhase, getWorkload(t, r, "stuck-app").Status.Phase)
+		})
+	}
+}
+
+func TestReconcile_DestroyRetriesAfterFailureAndKeepsSnapshot(t *testing.T) {
+	workload := lifecycleWorkload("doomed-app", desiredState(v1alpha1.DesiredStateDestroyed), v1alpha1.PhaseRunning)
+	destroyer := &stubDestroyer{destroyErr: errors.New("api server unavailable")}
+	r := newTestReconciler(t, workload, &stubPauser{}, destroyer)
+	r.metrics = &stubMetrics{cpuPerReplica: 500, memoryBytes: 256 << 20}
+
+	_, err := r.Reconcile(context.Background(), reconcileFor("doomed-app"))
+	require.Error(t, err)
+
+	failed := getWorkload(t, r, "doomed-app")
+	require.Equal(t, v1alpha1.PhaseDestroying, failed.Status.Phase)
+	require.NotNil(t, failed.Status.Destroy)
+	require.NotNil(t, failed.Status.Destroy.Resources, "snapshot must be persisted before the delete is attempted")
+	snapshot := *failed.Status.Destroy.Resources
+
+	destroyer.destroyErr = nil
+	destroyer.destroyDone = true
+	_, err = r.Reconcile(context.Background(), reconcileFor("doomed-app"))
+	require.NoError(t, err)
+
+	destroyed := getWorkload(t, r, "doomed-app")
+	assert.Equal(t, v1alpha1.PhaseDestroyed, destroyed.Status.Phase)
+	assert.Equal(t, 2, destroyer.destroyCalls)
+	require.NotNil(t, destroyed.Status.Destroy.Resources)
+	assert.Equal(t, snapshot, *destroyed.Status.Destroy.Resources)
+}
+
+func TestSetCondition_UpdatesReasonWithoutStatusChange(t *testing.T) {
+	r := &Reconciler{clock: func() time.Time { return fixedTime }}
+	workload := &v1alpha1.ManagedWorkload{}
+
+	r.setCondition(workload, conditionMetricsAvailable, metav1.ConditionFalse, "NoPodMetrics", "no pods reporting")
+	r.clock = func() time.Time { return fixedTime.Add(time.Hour) }
+	r.setCondition(workload, conditionMetricsAvailable, metav1.ConditionFalse, "MetricsUnavailable", "metrics API down")
+
+	cond := meta.FindStatusCondition(workload.Status.Conditions, conditionMetricsAvailable)
+	require.NotNil(t, cond)
+	assert.Equal(t, "MetricsUnavailable", cond.Reason, "a new cause must replace the stale one")
+	assert.Equal(t, "metrics API down", cond.Message)
+	assert.True(t, cond.LastTransitionTime.Time.Equal(fixedTime), "transition time only moves when the status changes")
+}
+
+func TestFindWorkloadsForTarget_MatchesKindAndName(t *testing.T) {
+	forDeployment := sharedTargetWorkload("deployment-api", "aaa", fixedTime)
+	forDeployment.Spec.Target = v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: "api"}
+	forStatefulSet := sharedTargetWorkload("statefulset-api", "bbb", fixedTime)
+	forStatefulSet.Spec.Target = v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindStatefulSet, Name: "api"}
+	r, _ := newSharedTargetReconciler(t, forDeployment, forStatefulSet)
+
+	tests := []struct {
+		name string
+		obj  client.Object
+		want []reconcile.Request
+	}{
+		{
+			name: "deployment",
+			obj:  &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"}},
+			want: []reconcile.Request{reconcileFor("deployment-api")},
+		},
+		{
+			name: "statefulset with the same name",
+			obj:  &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"}},
+			want: []reconcile.Request{reconcileFor("statefulset-api")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, r.findWorkloadsForTarget(context.Background(), tt.obj))
+		})
 	}
 }

@@ -28,7 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -98,7 +98,7 @@ func TestWorkloadPolicyReconciler_ScanUpdatesStatus(t *testing.T) {
 		WithRuntimeObjects(podMetrics).
 		Build()
 
-	r := &WorkloadPolicyReconciler{Client: c, Scheme: wpScheme(), Recorder: record.NewFakeRecorder(10)}
+	r := &WorkloadPolicyReconciler{Client: c, Scheme: wpScheme(), Recorder: events.NewFakeRecorder(10)}
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "staging-policy", Namespace: ns},
 	})
@@ -170,7 +170,7 @@ func TestWorkloadPolicyReconciler_AutoManageCreatesWorkloads(t *testing.T) {
 		WithRuntimeObjects(podMetrics).
 		Build()
 
-	r := &WorkloadPolicyReconciler{Client: c, Scheme: wpScheme(), Recorder: record.NewFakeRecorder(10)}
+	r := &WorkloadPolicyReconciler{Client: c, Scheme: wpScheme(), Recorder: events.NewFakeRecorder(10)}
 	_, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "dev-policy", Namespace: ns},
 	})
@@ -189,7 +189,7 @@ func TestWorkloadPolicyReconciler_AutoManageCreatesWorkloads(t *testing.T) {
 
 func TestWorkloadPolicyReconciler_PolicyNotFound(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(wpScheme()).Build()
-	r := &WorkloadPolicyReconciler{Client: c, Scheme: wpScheme(), Recorder: record.NewFakeRecorder(10)}
+	r := &WorkloadPolicyReconciler{Client: c, Scheme: wpScheme(), Recorder: events.NewFakeRecorder(10)}
 
 	result, err := r.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Name: "missing", Namespace: "ns"},
