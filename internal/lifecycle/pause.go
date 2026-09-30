@@ -50,13 +50,20 @@ func (p *Pauser) Pause(ctx context.Context, workload *v1alpha1.ManagedWorkload) 
 		return false, fmt.Errorf("getting target workload: %w", err)
 	}
 
+	// The controller creates Status.Pause before calling Pause, to hold the
+	// resource snapshot, so a nil check can't tell whether the replica count
+	// was recorded. PausedAt is only set once the workload has been paused.
 	if workload.Status.Pause == nil {
+		workload.Status.Pause = &v1alpha1.PauseStatus{}
+	}
+	if workload.Status.Pause.PausedAt == nil {
 		scale, err := p.scaler.GetScale(ctx, target)
 		if err != nil {
 			return false, fmt.Errorf("getting current replicas: %w", err)
 		}
-		workload.Status.Pause = &v1alpha1.PauseStatus{
-			PreviousReplicas: scale.Spec.Replicas,
+		// Keep a recorded count if a previous attempt already scaled to zero.
+		if scale.Spec.Replicas > 0 {
+			workload.Status.Pause.PreviousReplicas = scale.Spec.Replicas
 		}
 	}
 

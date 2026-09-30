@@ -81,10 +81,26 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
 
+E2E_IMAGES ?= curlimages/curl:8.7.1 registry.k8s.io/pause:3.10
+E2E_PLATFORM ?= linux/$(shell go env GOARCH)
+
+# Streams each image into the Kind node's containerd for one platform only.
+# `kind load docker-image` imports all platforms, which fails under Docker
+# Desktop's containerd image store: a pull only fetches the host platform,
+# so the other platforms' content is missing.
+.PHONY: load-test-e2e-images
+load-test-e2e-images: ## Preload the images the e2e specs run into the Kind cluster
+	@for img in $(E2E_IMAGES); do \
+		echo "Loading $$img ($(E2E_PLATFORM)) into $(KIND_CLUSTER)"; \
+		docker pull --quiet --platform $(E2E_PLATFORM) $$img >/dev/null && \
+		docker save $$img | docker exec -i $(KIND_CLUSTER)-control-plane \
+			ctr --namespace=k8s.io images import --platform $(E2E_PLATFORM) --snapshotter=overlayfs - >/dev/null \
+		|| exit 1; \
+	done
+
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	docker pull curlimages/curl:8.7.1
-	$(KIND) load docker-image curlimages/curl:8.7.1 --name $(KIND_CLUSTER)
+	$(MAKE) load-test-e2e-images
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
