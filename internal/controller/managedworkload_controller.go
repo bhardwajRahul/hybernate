@@ -746,15 +746,36 @@ func (r *Reconciler) findWorkloadsSharingTarget(ctx context.Context, obj client.
 	return requests
 }
 
+// targetRefFor identifies a watched object as a ManagedWorkload target.
+// Typed objects from the cache carry no GVK, so the kind comes from the Go
+// type rather than obj.GetObjectKind().
+func targetRefFor(obj client.Object) (v1alpha1.WorkloadRef, bool) {
+	switch obj.(type) {
+	case *appsv1.Deployment:
+		return v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: obj.GetName()}, true
+	case *appsv1.StatefulSet:
+		return v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindStatefulSet, Name: obj.GetName()}, true
+	default:
+		return v1alpha1.WorkloadRef{}, false
+	}
+}
+
 func (r *Reconciler) findWorkloadsForTarget(ctx context.Context, obj client.Object) []reconcile.Request {
+	target, ok := targetRefFor(obj)
+	if !ok {
+		return nil
+	}
+
 	var workloads v1alpha1.ManagedWorkloadList
 	if err := r.List(ctx, &workloads, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.FromContext(ctx).Error(err, "listing managed workloads for target",
+			"target", target.Name, "kind", target.Kind, "namespace", obj.GetNamespace())
 		return nil
 	}
 
 	var requests []reconcile.Request
 	for _, w := range workloads.Items {
-		if w.Spec.Target.Name == obj.GetName() {
+		if w.Spec.Target == target {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: w.Name, Namespace: w.Namespace},
 			})

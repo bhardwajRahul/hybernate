@@ -1118,3 +1118,34 @@ func TestSetCondition_UpdatesReasonWithoutStatusChange(t *testing.T) {
 	assert.Equal(t, "metrics API down", cond.Message)
 	assert.True(t, cond.LastTransitionTime.Time.Equal(fixedTime), "transition time only moves when the status changes")
 }
+
+func TestFindWorkloadsForTarget_MatchesKindAndName(t *testing.T) {
+	forDeployment := sharedTargetWorkload("deployment-api", "aaa", fixedTime)
+	forDeployment.Spec.Target = v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindDeployment, Name: "api"}
+	forStatefulSet := sharedTargetWorkload("statefulset-api", "bbb", fixedTime)
+	forStatefulSet.Spec.Target = v1alpha1.WorkloadRef{Kind: v1alpha1.TargetKindStatefulSet, Name: "api"}
+	r, _ := newSharedTargetReconciler(t, forDeployment, forStatefulSet)
+
+	tests := []struct {
+		name string
+		obj  client.Object
+		want []reconcile.Request
+	}{
+		{
+			name: "deployment",
+			obj:  &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"}},
+			want: []reconcile.Request{reconcileFor("deployment-api")},
+		},
+		{
+			name: "statefulset with the same name",
+			obj:  &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "default"}},
+			want: []reconcile.Request{reconcileFor("statefulset-api")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, r.findWorkloadsForTarget(context.Background(), tt.obj))
+		})
+	}
+}
